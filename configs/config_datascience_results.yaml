@@ -1,0 +1,27 @@
+# config_datascience_results.yaml
+#
+# Read-only result sources served by the /datascience_results routes.
+# Each entry names the upstream repository that writes the table, so the
+# provenance of every endpoint is traceable from configuration alone.
+
+datascience_results:
+  default_limit: 1000
+  max_limit:     5000
+
+  bioacoustics:
+    upstream_repo: 'veritree_bioacoustics'
+    schema:        'bioacoustics'
+    table:         'tbl_postprocess_site_level_indicies'
+    filters:       ['code_country', 'code_site', 'recording_year']
+
+  multispectral:
+    upstream_repo: 'veritree_multispectral_foresthealth'
+    schema:        'multispectral'
+    table:         'tbl_raster_results'
+    filters:       ['country', 'site', 'subsite', 'period', 'raster']
+
+  treetracker:
+    upstream_repo: 'veritree-tree-tracker-algorithms'
+    schema:        'treetracker'
+    table:         null      # TODO: upstream does not yet publish a results table
+    filters:       ['country', 'site', 'session_id']

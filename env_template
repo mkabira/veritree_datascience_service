@@ -1,0 +1,37 @@
+# Environment Variables Template
+# Fill in blanks "<<<>>>" with your credentials
+# Then rename this file to ".env"
+
+# --- API ---
+API_ENDPOINT_TOKEN = "<<<>>>"
+
+# --- Model providers (computer_vision routes) ---
+ANTHROPIC_API_KEY = "<<<>>>"
+OPENAI_API_KEY = "<<<>>>"
+GOOGLE_AI_STUDIO_API_KEY = "<<<>>>"
+
+# --- Analytics database (datascience_results routes) ---
+AWS_RDS_REGION_NAME = "<<<>>>"
+AWS_RDS_ENDPOINT = "<<<>>>"
+AWS_RDS_PORT = <<<>>>
+AWS_RDS_DB = "<<<>>>"
+AWS_RDS_USER_NAME = "<<<>>>"
+AWS_RDS_PASSWORD = "<<<>>>"
+
+# --- Default S3 bucket (shared handler) ---
+AWS_ACCESS_KEY_ID = "<<<>>>"
+AWS_SECRET_ACCESS_KEY = "<<<>>>"
+AWS_S3_REGION_NAME = "<<<>>>"
+AWS_S3_BUCKET_NAME = "<<<>>>"
+
+# --- Computer vision source bucket (inbound field photos) ---
+AWS_SOURCE_ACCESS_KEY_ID = "<<<>>>"
+AWS_SOURCE_SECRET_ACCESS_KEY = "<<<>>>"
+AWS_SOURCE_REGION_NAME = "<<<>>>"
+AWS_SOURCE_S3_BUCKET_NAME = "<<<>>>"
+
+# --- Computer vision destination bucket (annotated outputs) ---
+AWS_DESTINATION_ACCESS_KEY_ID = "<<<>>>"
+AWS_DESTINATION_SECRET_ACCESS_KEY = "<<<>>>"
+AWS_DESTINATION_REGION_NAME = "<<<>>>"
+AWS_DESTINATION_S3_BUCKET_NAME = "<<<>>>"

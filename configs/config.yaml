@@ -1,0 +1,29 @@
+# config.yaml
+#
+# Service-level configuration for the veritree datascience service.
+# Domain configuration lives alongside this file and is merged into one flat
+# namespace by src/utils/context.py :: load_config():
+#
+#   config_computer_vision.yaml       computer_vision routes
+#   config_datascience_results.yaml   datascience_results routes
+#
+# Every top-level key must be unique across all three files.
+
+prod_mode: True
+
+repo:
+  name:         'veritree_datascience_service'
+  description:  'Unified veritree datascience API: computer vision inference and analytics results'
+  version:      '0.1.0'
+
+directories:
+  data_input:   'data/data_input'
+  data_output:  'data/data_output'
+
+api_config:
+  local_data_input_dir:   "/api/data_input/"
+  local_data_output_dir:  "/api/data_output/"
+  s3_destination_basedir: "survivability"
+  push_logs_to_s3: False
+  host: '0.0.0.0'
+  port: 8000

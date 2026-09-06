@@ -1,0 +1,61 @@
+# veritree_datascience_service -- core runtime
+#
+# Merged from:
+#   veritree-survivability :: requirements_docker.txt   (deployed CV stack)
+#   veritree_multispectral_foresthealth :: requirements.txt
+#   veritree_bioacoustics :: requirements.txt
+#
+# Version conflicts resolved to the newer pin in every case:
+#   tensorflow  2.14.0  -> 2.15.1  (survivability, currently deployed)
+#   pandas      2.1.4   -> 2.2.1   (bioacoustics)
+#   geopandas   0.14.4  -> 1.1.3   (see requirements_geospatial.txt)
+#
+# Geospatial raster processing (rasterio/geopandas/GDAL) is NOT installed here:
+# the multispectral routes read already-published results out of Postgres and do
+# not open rasters. See requirements_geospatial.txt.
+
+# --- service ---
+fastapi==0.115.11
+uvicorn==0.34.0
+python-multipart==0.0.20
+click==8.1.8
+python-box==7.3.2
+python-dotenv==1.0.1
+PyYAML>=5.3.1
+
+# --- data / storage ---
+boto3==1.35.46
+botocore==1.35.46
+SQLAlchemy==2.0.30
+psycopg2-binary==2.9.11
+pandas==2.2.1
+numpy<2
+scipy>=1.4.1,<1.13
+
+# --- computer vision ---
+opencv-python>=4.1.1,<4.10
+pillow>=10.4.0
+piexif==1.1.3
+torch==2.2.2
+torchvision==0.17.2
+ultralytics==8.2.34
+open_clip_torch==3.3.0
+tensorflow==2.15.1
+ml_dtypes==0.3.2
+thop>=0.1.1
+
+# --- model providers ---
+anthropic==0.86.0
+openai==2.30.0
+google-genai==1.66.0
+litellm==1.83.4
+
+# --- misc ---
+requests==2.32.3
+requests-oauthlib==2.0.0
+tqdm>=4.66.3
+fonttools==4.54.1
+gitpython>=3.1.30
+
+# --- dev / test ---
+pytest==9.0.3

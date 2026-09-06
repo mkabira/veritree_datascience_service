@@ -1,0 +1,247 @@
+# config_computer_vision.yaml
+#
+# Ported verbatim from veritree-survivability :: configs/config.yaml
+# Owns: mangrove detection/classification pipeline, L3 verification tagging,
+#       AI content moderation (AICM) and verification summarization.
+
+pipeline:
+  object_model_path:    '/src/models/mangrove_detection_model/mangrove_detection_model.pt'
+  survival_model_path:  '/src/models/mangrove_classification_model/model.save'
+  image_path:           '/src/data/survivability_inference/local'
+  confidence:           0.4
+  classes_path:         '/configs/classes.yaml' #classes.yaml
+  results_csv_path:     null
+  save_dir:             '/src/data/survivability_inference/results'
+  save_cropped_mangroves: False
+
+
+pipeline_meta:
+  border:       400
+  pad_fraction: 0.25
+  min_size:     50
+  input_width:  224
+  input_height: 224
+
+
+classes:
+  Alive:        [[1.0, 0.0, 0.0], 0]
+  Dead/dormant: [[0.0, 1.0, 0.0], 1]
+  Unclear:      [[0.0, 0.0, 1.0], 2]
+
+
+### COMPUTER VISION L3-VERIFICATION CONFIGURATIONS
+l3_verification_cvmodel:
+  model_name: 'ViT-B-32'
+  pretrained: 'laion2b_s34b_b79k'
+  model_path: ''
+  verification_tags:
+      people: [
+        "a photo of a person or people in a planting field",
+        "a person working in a muddy field doing some planting",
+        "a photo of a person in a planting field",
+      ]
+      meterstick: [
+          "a meter stick"
+      ]
+  verification_thresholds:
+    people:     0.25
+    meterstick: 0.25
+
+l3_verification_gemini:
+  model_name: 'gemini-3-pro-image-preview'
+  system_prompt: "You are an advanced vision classifier for agricultural and sustainability applications.
+                  Your task is to perform object detection to determine if certain objects are in a photo.
+                  You must return JSON with probability from 0.0 to 1.0"
+  verification_tags:
+      people: "Is there a person in this image? A person can be in the form of a human silhouette, hands, legs, head, face"
+      meterstick: "Is there a meterstick in this image? A meterstick is mostly laid flat on the ground in a planting or muddy field"
+  verification_threshold: 0.8
+
+l3_verification_openai:
+  model_name: 'gpt-5.4'
+  system_prompt: "You are an advanced vision classifier for agricultural and sustainability applications.
+                  Your task is to perform object detection to determine if certain objects are in a photo.
+                  You must return JSON with probability from 0.0 to 1.0"
+  verification_tags:
+      people: "Is there a person in this image? A person can be in the form of a human silhouette, hands, legs, head, face"
+      meterstick: "Is there a meterstick in this image? A meterstick is mostly laid flat on the ground in a planting or muddy field"
+  verification_threshold: 0.8
+
+l3_verification_anthropic:
+  model_name: 'claude-sonnet-4-6'
+  system_prompt: "You are an advanced vision classifier for agricultural and sustainability applications.
+                  Your task is to perform object detection to determine if certain objects are in a photo.
+                  You must return JSON with probability from 0.0 to 1.0"
+  verification_tags:
+      people: "Is there a person in this image? A person can be in the form of a human silhouette, hands, legs, head, face"
+      meterstick: "Is there a meterstick in this image? A meterstick is mostly laid flat on the ground in a planting or muddy field"
+  verification_threshold: 0.8
+
+
+### L3-VERIFICATION PLANTING PARTNERS SUMMARIZATION
+verification_summarization:
+  model: "claude"
+  # model: "gpt-4o" #model versions were hardcoded as PROVIDER_ALIASES; refactor src/libs/utils to use specific model types
+  temperature: 0.2
+  system_prompt: >
+    You are a supervisor reviewing field planting verification data for a tree planting project.
+    Your role is to convert raw rule failure data into clear, actionable messages for the field team.
+    Every message MUST tell the field team exactly what action they need to take to pass the check —
+    not just what went wrong, but what to do to fix it. Be direct and specific.
+    Do not use markdown, bullet points, or headers. Write one plain-language sentence per rule.
+  user_prompt_template: >
+    Below are verification rules for a planting session submission.
+    Convert each failed rule into a short, actionable message for the field team that tells them
+    exactly what they need to do to pass the check.
+    Return a JSON array only — no extra text, no markdown, no code fences.
+    Each item must have "rule_public_id" and "message".
+
+    The failure_reason field is a structured object. Interpret it as follows:
+
+    type "simple", operator "not_null":
+      → "{{fact_name}} is missing — add it to the planting session."
+
+    type "simple", operator "between":
+      → "{{fact_name}} must be between {{min}} and {{max}} — update it to a value in that range."
+
+    type "quantified", quantifier "at_least":
+      → "Submit at least {{diff}} more {{fact_name}} — only {{found}} of the {{required}} required have been submitted."
+
+    type "quantified", quantifier "percentage":
+      → "At least {{required_pct}}% of {{fact_name}} must meet the criteria — currently only {{actual_pct}}% do ({{found}} out of {{total}} submitted)."
+
+    If failure_reason is null, use the rule name and comments to write a message that tells the field
+    team what action to take. Be specific about what they need to do based on the rule name and any comments.
+    If there are multiple comments, combine them into one sentence if possible; otherwise write two sentences.
+
+    Failed rules:
+    {failed_rules}
+
+    Example input:
+    [
+      {{"rule_public_id": "rule_abc", "name": "Photos required", "status": "failed", "failure_reason": {{"type": "quantified", "fact_name": "Photos", "quantifier": "at_least", "found": 3, "required": 20, "diff": 17}}, "comments": []}},
+      {{"rule_public_id": "rule_def", "name": "Planting date valid", "status": "failed", "failure_reason": {{"type": "simple", "fact_name": "Planting date", "operator": "not_null"}}, "comments": []}}
+    ]
+
+    Example output:
+    [{{"rule_public_id": "rule_abc", "message": "Submit at least 17 more Photos — only 3 of the 20 required have been submitted."}}, {{"rule_public_id": "rule_def", "message": "Planting date is missing — add it to the planting session."}}]
+
+    Now generate the JSON array for the rules above.
+    
+
+### AI COMPUTER VISION CONTENT MODERATION
+# NOTE: this classifier is called via a forced `record_detection` tool call
+# (see src/libs/veritag.py). Only two fields flow through the pipeline:
+#   detection (bool) and probability (float 0-1); the flag fires when
+#   probability > verification_threshold. The prompt below is therefore tuned
+#   to produce a WELL-CALIBRATED probability, not a rich JSON object.
+aicm_anthropic:
+  model_name: 'claude-sonnet-4-6'
+  system_prompt: |
+    You are a vision content-moderation classifier supporting a child-labor
+    compliance audit for a land-restoration (mangrove planting) organization. You
+    examine field photographs and estimate the likelihood that at least one MINOR
+    (a person who appears to be under 18) is present, so a trained human reviewer
+    can follow up. You are a triage layer, never the final decision-maker.
+
+    HARD LIMITS
+    - You assess APPARENT age from visible physical evidence only. You cannot know
+      anyone's true age, and you do not need to.
+    - You do NOT identify individuals and do NOT infer name, ethnicity, gender, or any
+      protected attribute. You judge only "does this body/face show the physical
+      markers of a person under 18?"
+    - Never describe anyone in a sexualized way or comment on appearance beyond what is
+      needed for age estimation.
+
+    CORE PRINCIPLE — PRECISION OVER PANIC
+    Trust in this system depends on NOT crying wolf. Flag a person as a likely minor
+    ONLY when positive, youth-specific physical evidence is actually visible. A person
+    being small, distant, bent over, crouching, barefoot, muddy, slim, or partially
+    hidden is NOT evidence of youth. Absence of clear adult features is NOT evidence of
+    youth. When a figure is genuinely unassessable, treat it as INDETERMINATE and keep
+    the probability low — do not inflate it "just in case."
+
+    POSITIVE YOUTH INDICATORS (look for several converging cues, not just one)
+    - Body proportion: proportionally large head relative to torso/shoulders; short
+      limbs relative to trunk; overall childlike build.
+    - Height / stature: markedly shorter than adults in frame, or short relative to
+      scale references (mature mangroves, buckets, poles, meter sticks, tools).
+    - Skeletal outline & bone structure: narrow shoulders, slight/undeveloped frame,
+      thin wrists and ankles, prominent/knobby joints, no adult shoulder breadth.
+    - Muscle structure: little to no developed adult musculature; smooth, undefined
+      arms and legs.
+    - Skin freshness: smooth, taut, unweathered skin; no wrinkles, no sun-aging, no
+      facial hair, no adult skin texture.
+    - Youthful facial features: rounded cheeks, soft/small jawline, smooth brow, larger
+      eye-to-face ratio, absence of facial hair or adult jaw/brow development.
+
+    ADULT INDICATORS (each should LOWER the probability)
+    Broad or squared shoulders, developed musculature, adult height, facial hair,
+    receding/mature hairline, weathered or wrinkled skin, pronounced jaw/brow, adult
+    body proportions. If a clearly visible person shows these, they are an adult even
+    if slim or bent over.
+
+    FALSE-POSITIVE TRAPS — DO NOT flag on these alone
+    - Adults bending, crouching, or squatting to plant (foreshortening makes them look
+      small). Judge by limb thickness, shoulder width, hands, and skin — not by the
+      compressed silhouette.
+    - Distant or tiny figures with no discernible facial or structural detail.
+    - Back-to-camera or face-hidden figures: rely on body proportion and musculature; if
+      still indeterminate, do not flag on posture or size alone.
+    - Slim or small-framed adults (including adult women in wraps/kitenge). Slimness is
+      not youth.
+    - Barefoot feet, muddy or informal or ill-fitting clothing — everyone here works
+      barefoot in mud; clothing and footwear carry NO age signal.
+
+    MULTIPLE PEOPLE
+    Assess each visible person independently. Your probability reflects the SINGLE most
+    likely minor in the image (the strongest case), not an average.
+
+    PROBABILITY CALIBRATION (anchor to these bands; threshold fires at 0.5)
+    - 0.90-0.99: A clearly visible person shows unmistakable child features (young child,
+      roughly pre-teen or younger) — e.g., small child standing beside a taller adult,
+      childlike proportions and smooth young face plainly visible.
+    - 0.70-0.89: A reasonably visible person shows several converging youth cues and
+      strongly reads as an adolescent/teen under 18, with few or no adult markers.
+    - 0.50-0.69: Real but partial youth evidence — some genuine youth cues visible but
+      resolution, angle, or occlusion leaves honest doubt. (Still flags for review.)
+    - 0.20-0.49: Ambiguous / indeterminate — small, distant, bent, or hidden figure with
+      NO clear youth cues; cannot be assessed. Do not flag.
+    - 0.00-0.19: All clearly visible people read as adults, or no people present.
+
+    CALIBRATION EXAMPLES (archetypes, not fixed rules)
+    - True positive (~0.95): a small child, large head-to-body ratio and thin limbs,
+      standing or working beside a clearly taller adult.
+    - True positive (~0.9): a barefoot child bent to press a seedling into the mud, face
+      down but limbs and frame plainly child-sized.
+    - True positive (~0.8): a lean shirtless adolescent handling a planting pole, youthful
+      face and undeveloped musculature, adults visible behind for scale.
+    - NOT a flag (~0.25): a row of adults bent over planting, backs to camera, no youth
+      cues visible — small-looking only because they are bent.
+    - NOT a flag (~0.1): distant figures in the tree line with no resolvable detail.
+
+    OUTPUT
+    Return your answer ONLY through the `record_detection` tool:
+    - detection: true if the most likely person is, on balance, a minor (i.e. your
+      probability is at or above the flag threshold), otherwise false.
+    - probability: your calibrated likelihood (0-1), per the bands above, that at least
+      one minor is present. Reason through the indicators internally; report only the
+      tool call.
+  verification_tags:
+      minor_flag: |
+        Examine this mangrove-planting field photograph. For every person visible,
+        apply the youth-evidence test from your instructions: look for converging
+        positive youth cues (body proportion, stature, skeletal outline, muscle
+        development, skin freshness, youthful facial features) and weigh any adult
+        markers against them.
+
+        Flag ONLY on positive youth evidence. Do NOT raise the probability merely
+        because a person is small, distant, bent over, barefoot, slim, or partly hidden.
+        If a figure cannot be assessed, treat it as indeterminate and keep the
+        probability low.
+
+        Report the single strongest case as a calibrated probability via the
+        record_detection tool.
+  # Calibrated on 51 confirmed minors vs 288 confirmed (hard) non-minors:
+  #   @0.20 -> recall 0.73, FPR 0.41 (vs old prompt recall 0.86 / FPR 0.63).
+  #   Chosen operating point: favours recall while cutting false positives.
