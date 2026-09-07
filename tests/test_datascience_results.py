@@ -96,3 +96,49 @@ class TestValidation:
         """A quote-breaking filter value must match nothing, not widen the result set."""
         body = client.get(f"{BIOACOUSTICS}?code_country=KEN' OR '1'='1", headers=auth).json()
         assert body["n_records"] == 0
+
+
+class TestPagingHappensInSql:
+    """
+    Paging must be pushed to the database, not applied to a fully-materialised frame.
+
+    These tables grow every survey season; `select *` followed by a Python slice
+    would load the whole table into memory on every request.
+    """
+
+    def test_limit_and_offset_reach_the_database(self, client, auth, monkeypatch):
+        from src.awskit import datastores
+
+        captured = {}
+        original = datastores._fetch_page
+
+        def spy(table, filters, limit, offset):
+            captured.update(table=table, limit=limit, offset=offset)
+            return original(table, filters, limit, offset)
+
+        monkeypatch.setattr(datastores, "_fetch_page", spy)
+        client.get(f"{BIOACOUSTICS}?limit=1&offset=1", headers=auth)
+
+        assert captured["limit"] == 1, "limit must be passed down, not applied in Python"
+        assert captured["offset"] == 1
+
+    def test_only_the_page_is_fetched_not_the_whole_table(self, client, auth):
+        """n_records is the full count; the row payload is only the page."""
+        body = client.get(f"{BIOACOUSTICS}?limit=1", headers=auth).json()
+
+        assert body["n_records"] == 2, "total comes from a COUNT, not len(rows)"
+        assert body["n_returned"] == 1
+        assert len(body["results"]) == 1
+
+    def test_the_table_name_is_never_taken_from_request_data(self, client, auth):
+        """Table names are interpolated, so they must come from module constants."""
+        from src.awskit import datastores
+        import inspect
+
+        source = inspect.getsource(datastores)
+        assert "BIOACOUSTICS_TABLE" in source
+        assert "MULTISPECTRAL_TABLE" in source
+        # the only f-string interpolations into SQL are the table and the where clause
+        for line in source.splitlines():
+            if 'text(f"' in line:
+                assert '{table}' in line or '{where}' in line, f"unbound SQL: {line.strip()}"

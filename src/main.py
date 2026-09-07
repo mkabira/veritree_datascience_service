@@ -1,3 +1,15 @@
+"""
+Command-line entry point for the veritree datascience service.
+
+Dispatches named tasks and pipelines, the convention shared across the veritree
+datascience repositories and the contract the ECS task definitions invoke:
+
+    python3 src/main.py pipeline pipeline_api
+    python3 src/main.py task task_launch_api
+
+Today the only task launches the API; scheduled work belongs in the same registry.
+"""
+
 import os
 import subprocess
 
@@ -39,10 +51,13 @@ pipeline_names = {
 @click.argument('run_arg', required=1)
 def run_service(run_type, run_arg, task_dict=task_names, pipeline_dict=pipeline_names):
     """
-    run_type (str): one of ['task' or 'pipeline']
-    run_arg (str): name of task or pipeline to run
-    task_dict (dict): dictionary of task names and task function mappings
-    pipeline_dict (dict): dictionary of pipeline names and task function mappings
+    Run a named task, or every task in a named pipeline.
+
+    :param run_type: either 'task' or 'pipeline'
+    :param run_arg: name of the task or pipeline to run
+    :param task_dict: mapping of task name to the function implementing it
+    :param pipeline_dict: mapping of pipeline name to its ordered list of task names
+    :return: None
     """
     print(os.getcwd())
 

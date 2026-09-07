@@ -1,41 +1,43 @@
 """
-Computer vision routes.
+Computer vision route.
 
-  /computer_vision/survivability_classifier   mangrove detection + alive/dead classification
-  /computer_vision/content_tagging            field photo evidence tagging (people, meterstick, ...)
-  /computer_vision/content_moderation         AI content moderation over field photos
+One endpoint, ``POST /computer_vision/``, dispatching to a service named in the
+request body:
 
-Ported from veritree-survivability :: api/surv_endpoint.py. The provider-specific
-veritag_{cvmodel,gemini,openai,anthropic} routes of that service are collapsed here into a
-single content_tagging route with a `provider` field; anthropic remains the production default.
+  survivability_detection   mangrove detection + alive/dead/unclear classification
+  content_tagging           field photo evidence tagging (people, meterstick, ...)
+  content_moderation        AI content moderation over field photos
+
+All three take the same input -- one image in the veritree S3 bucket -- so the
+source is read and decoded ONCE here and the decoded image handed to whichever
+service was asked for. Each returns its own ``result`` shape inside a common
+envelope.
+
+Ported from veritree-survivability :: api/surv_endpoint.py, which exposed these as
+six separate routes. Anthropic is the only tagging backend: it measured best on
+veritree field photos, so the OpenCLIP, Gemini and OpenAI taggers were retired.
 """
 
 import io
 import os
 import uuid
-from datetime import datetime, timezone
-from typing import Literal, Optional
+from typing import Annotated, List, Literal, Optional, Union
 
-from PIL import Image
-from fastapi import APIRouter, Depends, File, HTTPException, UploadFile, status
-from fastapi.responses import JSONResponse, Response
-from pydantic import BaseModel
+from PIL import Image, UnidentifiedImageError
+from fastapi import APIRouter, Body, Depends, HTTPException, status
+from pydantic import BaseModel, ConfigDict, Field
 
 from api.dependencies import api_authentication
 
 from src.awskit.datahandlers import S3StorageHandler
 
-from src.libs import veritag
-from src.libs.utils import copy_exif, delete_file, empty_folder
+from src.libs.veritag import load_photo
 
-from src.services.computer_vision.survivability import inference_light
-from src.services.computer_vision.survivability.inference import run_survivability_inference
-from src.services.computer_vision.photo_tagging.verification_photo_tagging import (
-    run_veritag_anthropic,
-    run_veritag_cvmodel,
-    run_veritag_gemini,
-    run_veritag_openai,
+from src.services.computer_vision.survivability_detection import (
+    detect_survivability,
+    load_models as load_survivability_models,
 )
+from src.services.computer_vision.content_tagging import run_veritag_anthropic
 
 from src.utils import context
 
@@ -47,377 +49,385 @@ logger = context.logger
 router = APIRouter(prefix="/computer_vision", tags=["computer_vision"])
 
 
-# ---------------------------------------------------------------------------
-# S3 handlers
-#
-# Two distinct buckets: images arrive in a source bucket and annotated outputs are
-# written to a veritree-owned destination bucket, so these are separate from the
-# single shared s3_handler in src.awskit.datahandlers.
-# ---------------------------------------------------------------------------
+# Only the source bucket is needed: every service reads an image and returns JSON, so
+# nothing is written back to S3.
+s3_source_handler = S3StorageHandler(
+    aws_accesskey=os.getenv("AWS_SOURCE_ACCESS_KEY_ID"),
+    aws_secretkey=os.getenv("AWS_SOURCE_SECRET_ACCESS_KEY"),
+    aws_regionname=os.getenv("AWS_SOURCE_REGION_NAME"),
+    aws_bucketname=os.getenv("AWS_SOURCE_S3_BUCKET_NAME"),
+    prod_mode=config.prod_mode,
+)
 
-s3_configuration_default = {
-    "source_bucket": {
-        "aws_accesskey": os.getenv("AWS_SOURCE_ACCESS_KEY_ID"),
-        "aws_secretkey": os.getenv("AWS_SOURCE_SECRET_ACCESS_KEY"),
-        "aws_regionname": os.getenv("AWS_SOURCE_REGION_NAME"),
-        "aws_bucketname": os.getenv("AWS_SOURCE_S3_BUCKET_NAME"),
-        "prod_mode": config.prod_mode
-    },
-    "destination_bucket": {
-        "aws_accesskey": os.getenv("AWS_DESTINATION_ACCESS_KEY_ID"),
-        "aws_secretkey": os.getenv("AWS_DESTINATION_SECRET_ACCESS_KEY"),
-        "aws_regionname": os.getenv("AWS_DESTINATION_REGION_NAME"),
-        "aws_bucketname": os.getenv("AWS_DESTINATION_S3_BUCKET_NAME"),
-        "prod_mode": config.prod_mode
-    }
-}
-
-s3_source_handler = S3StorageHandler(**s3_configuration_default['source_bucket'])
-s3_destination_handler = S3StorageHandler(**s3_configuration_default['destination_bucket'])
-
-
-# ---------------------------------------------------------------------------
-# OpenCLIP model, loaded once at import so the weights are not re-read per request
-# ---------------------------------------------------------------------------
-
-model, preprocess, tokenizer = veritag.load_openclip(
-    model_name=config.l3_verification_cvmodel.model_name,
-    pretrained=config.l3_verification_cvmodel.pretrained)
-
-label_keys, text_features = veritag.build_text_features(
-    labels_dict=config.l3_verification_cvmodel.verification_tags,
-    model=model,
-    tokenizer=tokenizer)
+# Pay the model-loading cost at import rather than on the first request.
+load_survivability_models()
 
 
 # ---------------------------------------------------------------------------
 # Schemas
 # ---------------------------------------------------------------------------
 
-class SurvS3Source(BaseModel):
-    org_id:     str
-    image_url:  str
+class ComputerVisionInput(BaseModel):
+    """Request body: which service to run, and the image to run it on."""
+
+    service: Literal['survivability_detection', 'content_tagging', 'content_moderation'] = Field(
+        ..., description="Which computer vision service to route the image to")
+    image_url: str = Field(
+        ..., description="S3 object key, or an https:// URL to the same object")
 
 
-class SurvS3Response(BaseModel):
-    session_id:        str
-    s3cv_url:          str
-    number_mangroves:  int
-    number_alive:      int
-    number_dead:       int
-    number_unclear:    int
+REQUEST_EXAMPLES = {
+    "survivability_detection": {
+        "summary": "survivability_detection — count alive/dead mangroves",
+        "description": (
+            "Detects mangroves and classifies each as alive, dead or unclear. Returns "
+            "`counts` plus a `detections` list, each carrying `bbox_xyxy` in absolute "
+            "pixels of the source image and `bbox_xywhn` normalised."
+        ),
+        "value": {
+            "service": "survivability_detection",
+            "image_url": "bulk_uploads/33/2026-03-16/mangroves.jpg",
+        },
+    },
+    "content_tagging": {
+        "summary": "content_tagging — tag photo evidence for L3 verification",
+        "description": (
+            "Tags the image against the labels in `config_cv_content_tagging.yaml` "
+            "(`people`, `meterstick`, ...). If `people` is detected the image is routed "
+            "through content moderation automatically and those tags are merged in, so "
+            "this can return moderation tags too."
+        ),
+        "value": {
+            "service": "content_tagging",
+            "image_url": "bulk_uploads/33/2026-03-16/planting_evidence.jpg",
+        },
+    },
+    "content_moderation": {
+        "summary": "content_moderation — flag images needing human review",
+        "description": (
+            "Runs AI Content Moderation over the image. Returns `flagged` plus the tags "
+            "behind it, and `scores` for every candidate regardless of the configured "
+            "threshold, so an alternative operating point can be assessed without "
+            "redeploying."
+        ),
+        "value": {
+            "service": "content_moderation",
+            "image_url": "bulk_uploads/33/2026-03-16/planting_evidence.jpg",
+        },
+    },
+    "https_url": {
+        "summary": "any service — addressing the image by https:// URL",
+        "description": (
+            "`image_url` also accepts a full URL to the same object, fetched over HTTP "
+            "instead of through the bucket handler."
+        ),
+        "value": {
+            "service": "content_tagging",
+            "image_url": "https://veritreephotos.s3.us-east-2.amazonaws.com/bulk_uploads/33/img.jpeg",
+        },
+    },
+}
 
 
-class TagInput(BaseModel):
-    image_url: str
-    provider: Literal['anthropic', 'gemini', 'openai', 'cvmodel'] = 'anthropic'
+class BoundingBox(BaseModel):
+    """One detected mangrove: where it is, and how it was classified."""
+
+    detection_id: str = Field(..., description="Unique per detection, per request")
+    index: int = Field(..., description="Position within this image's detections")
+    status: Literal['alive', 'dead', 'unclear'] = Field(
+        ..., description="Highest-probability class from the classifier")
+    detection_confidence: float = Field(
+        ..., description="Detector's confidence that this is a mangrove at all")
+    bbox_xyxy: List[float] = Field(..., description="Absolute pixels [x1, y1, x2, y2]")
+    bbox_xywhn: List[float] = Field(..., description="Normalised [x_center, y_center, w, h]")
+    probabilities: dict
 
 
-class TagOutput(BaseModel):
-    session_id: str
-    tags:       list
-    scores:     Optional[dict] = None
+class SurvivabilityCounts(BaseModel):
+    """Aggregate survival counts across all detections in one image."""
+
+    number_mangroves: int = Field(..., description="Total mangroves detected")
+    number_alive: int
+    number_dead: int
+    number_unclear: int = Field(
+        ..., description="Detected, but the model could not determine survival status")
 
 
-class ModerationInput(BaseModel):
-    image_url: str
+class SurvivabilityResult(BaseModel):
+    """Result of ``survivability_detection``: counts plus per-mangrove boxes."""
+
+    model_config = ConfigDict(json_schema_extra={"example": {
+        "counts": {"number_mangroves": 107, "number_alive": 78,
+                   "number_dead": 4, "number_unclear": 25},
+        "detections": [{
+            "detection_id": "4cd88ae5-ab26-4772-9db0-5a75557051ce",
+            "index": 0,
+            "status": "alive",
+            "detection_confidence": 0.8801,
+            "bbox_xyxy": [854.39, 650.0, 904.03, 807.26],
+            "bbox_xywhn": [0.457922, 0.674658, 0.025858, 0.145614],
+            "probabilities": {"alive": 0.9999, "dead": 0.0, "unclear": 0.0001},
+        }],
+    }})
+
+    counts: SurvivabilityCounts
+    detections: List[BoundingBox]
 
 
-class ModerationOutput(BaseModel):
-    session_id: str
-    flagged:    bool
-    tags:       list
-    scores:     Optional[dict] = None
+class TaggingResult(BaseModel):
+    """Result of ``content_tagging``: tags that cleared their threshold."""
+
+    model_config = ConfigDict(json_schema_extra={"example": {
+        "tags": ["people", "meterstick"],
+        "scores": {"people": 0.97, "meterstick": 0.88},
+    }})
+
+    tags: List[str]
+    scores: Optional[dict] = Field(
+        None, description="Every candidate tag's score, including those below threshold")
+
+
+class ModerationResult(BaseModel):
+    """Result of ``content_moderation``: whether the image needs human review."""
+
+    model_config = ConfigDict(json_schema_extra={"example": {
+        "flagged": True,
+        "tags": ["minor_flagged"],
+        "scores": {"minor_flagged": 0.81},
+    }})
+
+    flagged: bool = Field(..., description="True when the image needs human review")
+    tags: List[str]
+    scores: Optional[dict] = Field(
+        None, description="Every candidate tag's score, including those below threshold")
+
+
+class ImageDimensions(BaseModel):
+    """Source image size, the frame ``bbox_xyxy`` pixels are measured in."""
+
+    width: int
+    height: int
+
+
+class ComputerVisionOutput(BaseModel):
+    """
+    Response envelope shared by every service.
+
+    ``service`` identifies which ``result`` shape is present, so a client can branch
+    on the field it sent rather than probing the payload.
+    """
+
+    service: str = Field(..., description="The service that produced `result`")
+    session_id: str = Field(..., description="Correlation id, also written to the logs")
+    image_url: str = Field(..., description="The source as supplied, echoed back")
+    image: ImageDimensions = Field(
+        ..., description="Source dimensions; the frame `bbox_xyxy` is measured in")
+    result: Union[SurvivabilityResult, TaggingResult, ModerationResult] = Field(
+        ..., description="Service-specific payload; branch on `service`")
 
 
 # ---------------------------------------------------------------------------
-# survivability_classifier
+# Image loading
 # ---------------------------------------------------------------------------
 
-@router.post("/survivability_classifier/", response_model=SurvS3Response,
-             dependencies=[Depends(api_authentication)])
-async def survivability_classifier(params: SurvS3Source):
+def _load_image(image_url: str) -> Image.Image:
     """
-    Return survivability metrics for an image held in S3, and write the annotated
-    image back to the destination bucket.
+    Load the source image once, whichever way the caller addressed it.
 
-    :param params: json payload of the form {'org_id': '123', 'image_url': 's3://xyz'}
-    :return: processed image s3 path and computer vision metrics
+    Accepts both forms in use across the veritree services: a bare S3 object key,
+    read through the bucket handler, or an https:// URL to the same object, fetched
+    over HTTP. Reading here rather than inside each service means one fetch per
+    request no matter which service runs, and no image ever touches local disk.
+
+    :param image_url: S3 object key, or an https:// URL
+    :return: the decoded PIL image
+    :raises HTTPException: 502 if the source cannot be read, 400 if it is not an image
     """
-
-    logger.info("computer_vision survivability_classifier: ENTRY")
-
-    session_id = str(uuid.uuid4())
-    datenow = datetime.now(timezone.utc).strftime('%Y-%m-%d')
-
-    s3_source_img_url = params.image_url
-    s3_filename = s3_source_img_url.split('/')[-1]
-    fileprefix = s3_filename.split('.')[0]
-    filesuffix = s3_filename.split('.')[1]
-    local_filename = f"{fileprefix}_cv_{session_id}.{filesuffix}"
-    local_filepath = context.root_dir + config.api_config.local_data_input_dir + local_filename
-
-    s3_source_handler.download(s3_source_img_url, local_filepath)
-
-    logger.info(f'client reached: /computer_vision/survivability_classifier: session_id={session_id}')
 
     try:
-        _image, _surv_results = inference_light.run_survivability_inference(
-            config=config,
-            path_input_img=local_filepath,
-            session_id=session_id)
+        if image_url.startswith(('http://', 'https://')):
+            return load_photo(image_url)
 
-        local_savepath = context.root_dir + config.api_config.local_data_output_dir + local_filename
-        _image.save(local_savepath)
+        return Image.open(io.BytesIO(s3_source_handler.read_bytes(image_url)))
 
-        copy_exif(source_path=local_filepath, target_path=local_savepath, output_path=local_savepath)
-
-        location_destination = f"{config.api_config.s3_destination_basedir}/{params.org_id}/{datenow}/{local_filename}"
-        s3_destination_handler.upload(local_savepath, location_destination)
-        logger.info(f'Survivability computer vision output uploaded to {location_destination}')
-
-        logger.info('Cleaning up generated local files')
-        delete_file(local_filepath)
-        delete_file(local_savepath)
-
-        logger.info("computer_vision survivability_classifier: EXIT")
-
-        return SurvS3Response(
-            session_id=session_id,
-            s3cv_url=location_destination,
-            number_mangroves=_surv_results["n_mangroves"],
-            number_alive=_surv_results["n_alive"],
-            number_dead=_surv_results["n_dead"],
-            number_unclear=_surv_results["n_unclear"],
-        )
-
-    except Exception as e:
-        err_string = f"Exception while processing survivability_classifier: {str(e)}"
+    except UnidentifiedImageError as e:
+        err_string = f"Source at {image_url} is not a readable image: {e}"
         logger.error(err_string)
-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=err_string)
-
-
-@router.post("/survivability_classifier/image/", dependencies=[Depends(api_authentication)])
-async def survivability_classifier_image(file: UploadFile = File(...)):
-    """
-    Process a directly uploaded image and return it annotated with mangrove
-    detections and classifications.
-
-    :param file: image file
-    :return: image bytes
-    """
-
-    logger.info('client reached: /computer_vision/survivability_classifier/image')
-
-    local_data_input_dir = config.api_config.local_data_input_dir
-    local_data_output_dir = config.api_config.local_data_output_dir
-    empty_folder(context.root_dir + local_data_input_dir)
-    empty_folder(context.root_dir + local_data_output_dir)
-
-    try:
-        image_bytes = await file.read()
-        image_in = Image.open(io.BytesIO(image_bytes))
-        image_in.save(f"{context.root_dir + local_data_input_dir}/surv_image.png")
-
-        config.pipeline.prod_mode = False
-        config.pipeline.save_cropped_mangroves = False
-        config.pipeline.image_path = local_data_input_dir
-        config.pipeline.save_dir = local_data_output_dir
-
-        _, _ = run_survivability_inference(config=config)
-
-        image_out = Image.open(
-            f"{context.root_dir + local_data_output_dir}/surv_image/surv_image_mangroves_annotated.jpg")
-        image_out_bytes = io.BytesIO()
-        image_out.save(image_out_bytes, format=image_out.format or "png")
-
-        return Response(
-            content=image_out_bytes.getvalue(),
-            media_type=f"image/{image_out.format.lower() if image_out.format else 'png'}")
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=err_string)
 
     except Exception as e:
-        logger.error(f"Exception while processing survivability_classifier/image: {str(e)}")
-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
-
-
-@router.post("/survivability_classifier/results/", dependencies=[Depends(api_authentication)])
-async def survivability_classifier_results(file: UploadFile = File(...)):
-    """
-    Return survivability metrics for a directly uploaded image: number of mangroves,
-    dead, alive, and unclear.
-
-    :param file: image file
-    :return: json/dictionary of metrics
-    """
-
-    logger.info('client reached: /computer_vision/survivability_classifier/results')
-
-    local_data_input_dir = config.api_config.local_data_input_dir
-    local_data_output_dir = config.api_config.local_data_output_dir
-    empty_folder(context.root_dir + local_data_input_dir)
-    empty_folder(context.root_dir + local_data_output_dir)
-
-    try:
-        image_bytes = await file.read()
-        image_in = Image.open(io.BytesIO(image_bytes))
-        image_in.save(f"{context.root_dir + local_data_input_dir}/surv_image.png")
-
-        config.pipeline.prod_mode = False
-        config.pipeline.save_cropped_mangroves = False
-        config.pipeline.image_path = local_data_input_dir
-        config.pipeline.save_dir = local_data_output_dir
-
-        _, _surv_results = run_survivability_inference(config=config)
-
-        return JSONResponse(content=_surv_results)
-
-    except Exception as e:
-        logger.error(f"Exception while processing survivability_classifier/results: {str(e)}")
-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
+        err_string = f"Unable to read image {image_url}: {e}"
+        logger.error(err_string)
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=err_string)
 
 
 # ---------------------------------------------------------------------------
-# content_tagging
+# Services
 # ---------------------------------------------------------------------------
 
-def _run_content_tagging(provider: str, image_url: str, session_id: str):
+def _run_survivability_detection(image, session_id: str) -> SurvivabilityResult:
     """
-    Dispatch a tagging request to the configured provider.
+    Detect mangroves and classify each as alive, dead or unclear.
 
-    :return: (matches, dict_scores)
+    :param image: decoded PIL image
+    :param session_id: correlation id for logging
+    :return: counts and per-mangrove bounding boxes
     """
 
-    if provider == 'cvmodel':
-        cfg = config.l3_verification_cvmodel
-        return run_veritag_cvmodel(
-            model=model,
-            preprocess=preprocess,
-            label_keys=label_keys,
-            text_features=text_features,
-            path_input_img=image_url,
-            thresholds=cfg.verification_thresholds,
-            session_id=session_id)
+    results = detect_survivability(image, session_id=session_id)
 
-    runners = {
-        'anthropic': (run_veritag_anthropic, config.l3_verification_anthropic),
-        'gemini':    (run_veritag_gemini,    config.l3_verification_gemini),
-        'openai':    (run_veritag_openai,    config.l3_verification_openai),
-    }
+    return SurvivabilityResult(counts=results['counts'], detections=results['detections'])
 
-    runner, cfg = runners[provider]
 
-    return runner(
+def _run_content_tagging(image, session_id: str) -> TaggingResult:
+    """
+    Tag an image against the L3 verification labels.
+
+    When ``people`` is detected the image is additionally routed through content
+    moderation and the moderation tags are merged in, preserving the chaining
+    behaviour of the deployed veritag_anthropic route.
+
+    :param image: decoded PIL image
+    :param session_id: correlation id for logging
+    :return: matched tags and every tag's score
+    """
+
+    cfg = config.content_tagging_anthropic
+
+    matches, scores = run_veritag_anthropic(
         model_name=cfg.model_name,
-        path_input_img=image_url,
+        image=image,
         tag_names=cfg.verification_tags,
         system_prompt=cfg.system_prompt,
         threshold=cfg.verification_threshold,
         session_id=session_id)
 
+    if 'people' in matches:
+        logger.info('person detected in the image, routing to AI Content Moderation node')
 
-@router.post("/content_tagging/", response_model=TagOutput,
-             dependencies=[Depends(api_authentication)])
-async def content_tagging(params: TagInput):
-    """
-    Tag field photo evidence for L3 verification (people, meterstick, ...).
+        moderation = _run_content_moderation(image, session_id)
 
-    When `people` is detected the image is additionally routed through content
-    moderation, and any moderation tags are merged into the response -- this
-    preserves the AICM chaining behaviour of the deployed veritag_anthropic route.
+        matches = list(matches) + list(moderation.tags)
+        scores = dict(scores) | dict(moderation.scores or {})
 
-    :param params: {'image_url': 'https://veritreephotos..', 'provider': 'anthropic'}
-    :return: session_id and list of tags for the photo evidence
-    """
+        logger.warning(f"AICM matches found: {moderation.tags} with scores: {moderation.scores}")
+    else:
+        logger.info('no people detected, skipping AI Content Moderation node')
 
-    logger.info(f"computer_vision content_tagging (provider={params.provider}): ENTRY")
-
-    session_id = str(uuid.uuid4())
-
-    try:
-        matches, dict_matches = _run_content_tagging(params.provider, params.image_url, session_id)
-
-        if params.provider == 'cvmodel':
-            matches = list(matches.keys())
-
-        if 'people' in matches:
-            logger.info('person detected in the image, routing to AI Content Moderation node')
-
-            matches_aicm, dict_score_aicm = _run_content_moderation(params.image_url, session_id)
-
-            matches = list(matches) + list(matches_aicm)
-            dict_matches = dict(dict_matches) | dict(dict_score_aicm)
-
-            logger.warning(f"AICM matches found: {matches_aicm} with scores: {dict_score_aicm}")
-        else:
-            logger.info('no people detected, skipping AI Content Moderation node')
-
-        logger.info(f"computer_vision content_tagging: EXIT session_id={session_id}")
-
-        return TagOutput(session_id=session_id, tags=list(matches), scores=dict(dict_matches))
-
-    except Exception as e:
-        err_string = f"Exception while processing content_tagging: {str(e)}"
-        logger.error(err_string)
-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=err_string)
+    return TaggingResult(tags=list(matches), scores=dict(scores))
 
 
-# ---------------------------------------------------------------------------
-# content_moderation
-# ---------------------------------------------------------------------------
-
-def _run_content_moderation(image_url: str, session_id: str):
+def _run_content_moderation(image, session_id: str) -> ModerationResult:
     """
     Run AI content moderation (AICM) over a field photo.
 
-    :return: (matches, dict_scores)
+    A triage layer, never the final decision: a flagged image goes to a trained
+    reviewer. The AICM prompt and its calibrated threshold are tuned against this
+    model.
+
+    :param image: decoded PIL image
+    :param session_id: correlation id for logging
+    :return: whether the image is flagged, and the moderation tags behind it
     """
 
     cfg = config.aicm_anthropic
 
-    return run_veritag_anthropic(
+    matches, scores = run_veritag_anthropic(
         model_name=cfg.model_name,
-        path_input_img=image_url,
+        image=image,
         tag_names=cfg.verification_tags,
         system_prompt=cfg.system_prompt,
         threshold=cfg.verification_threshold,
         session_id=session_id)
 
+    flagged = bool(matches)
 
-@router.post("/content_moderation/", response_model=ModerationOutput,
-             dependencies=[Depends(api_authentication)])
-async def content_moderation(params: ModerationInput):
+    if flagged:
+        logger.warning(f"AICM flagged image with tags {matches} and scores {scores}")
+
+    return ModerationResult(flagged=flagged, tags=list(matches), scores=dict(scores))
+
+
+SERVICES = {
+    'survivability_detection': _run_survivability_detection,
+    'content_tagging': _run_content_tagging,
+    'content_moderation': _run_content_moderation,
+}
+
+
+# ---------------------------------------------------------------------------
+# Route
+# ---------------------------------------------------------------------------
+
+@router.post(
+    "/",
+    response_model=ComputerVisionOutput,
+    summary="Run a computer vision service on an image",
+    response_description="The service's result, inside the shared envelope",
+    dependencies=[Depends(api_authentication)],
+    responses={
+        400: {"description": "The source was fetched but is not a readable image"},
+        401: {"description": "Missing or invalid `Token` header"},
+        422: {"description": "Unknown `service`, or a missing required field"},
+        502: {"description": "The source image could not be read from S3 or over HTTP"},
+    },
+)
+async def computer_vision(
+    params: Annotated[ComputerVisionInput, Body(openapi_examples=REQUEST_EXAMPLES)],
+):
     """
-    Run AI Content Moderation over a field photo, flagging images that require
-    review before publication (e.g. images containing minors).
+    Run one computer vision service against one image.
 
-    Exposed as a standalone route here; it is also chained automatically from
-    /computer_vision/content_tagging whenever people are detected.
+    Pick the pipeline with **`service`**:
 
-    :param params: {'image_url': 'https://veritreephotos..'}
-    :return: session_id, flagged boolean and moderation tags
+    | `service` | Returns |
+    |---|---|
+    | `survivability_detection` | `counts` (mangroves, alive, dead, unclear) and `detections` with bounding boxes |
+    | `content_tagging` | `tags` that cleared their threshold, and `scores` for every candidate |
+    | `content_moderation` | `flagged`, the moderation `tags`, and `scores` |
+
+    **Addressing the image.** `image_url` takes a bare S3 object key
+    (`bulk_uploads/33/2026-03-16/img.jpg`), read through the source bucket, or an
+    `https://` URL to the same object, fetched over HTTP. The image is read and
+    decoded once per request whichever service runs, and is never written back to S3
+    or to local disk — a photo is stored exactly once.
+
+    **The response envelope** is the same for every service: `service`, `session_id`,
+    `image_url`, `image` (the pixel dimensions `bbox_xyxy` is measured in), and
+    `result`. Branch on `service` to know which `result` shape you have.
+
+    **Chaining.** `content_tagging` routes into content moderation automatically when
+    it detects `people`, and merges the moderation tags into its own — so a tagging
+    call can legitimately return moderation tags.
+
+    :param params: {'service': ..., 'image_url': ...}
+    :return: the envelope, carrying the service's own result shape
+    :raises HTTPException: 400 if the source is not an image, 502 if it cannot be
+        read, 500 if the service itself fails
     """
-
-    logger.info("computer_vision content_moderation: ENTRY")
 
     session_id = str(uuid.uuid4())
 
+    logger.info(f"computer_vision {params.service}: ENTRY "
+                f"session_id={session_id} image={params.image_url}")
+
+    image = _load_image(params.image_url)
+
     try:
-        matches, dict_matches = _run_content_moderation(params.image_url, session_id)
+        with image:
+            width, height = image.size
+            result = SERVICES[params.service](image, session_id)
 
-        flagged = bool(matches)
+        logger.info(f"computer_vision {params.service}: EXIT session_id={session_id}")
 
-        if flagged:
-            logger.warning(f"AICM flagged image with tags {matches} and scores {dict_matches}")
-
-        logger.info(f"computer_vision content_moderation: EXIT session_id={session_id}")
-
-        return ModerationOutput(
+        return ComputerVisionOutput(
+            service=params.service,
             session_id=session_id,
-            flagged=flagged,
-            tags=list(matches),
-            scores=dict(dict_matches))
+            image_url=params.image_url,
+            image=ImageDimensions(width=width, height=height),
+            result=result)
 
     except Exception as e:
-        err_string = f"Exception while processing content_moderation: {str(e)}"
+        err_string = f"Exception while processing computer_vision {params.service}: {e}"
         logger.error(err_string)
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=err_string)

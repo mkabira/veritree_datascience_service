@@ -4,8 +4,11 @@
 # Domain configuration lives alongside this file and is merged into one flat
 # namespace by src/utils/context.py :: load_config():
 #
-#   config_computer_vision.yaml       computer_vision routes
-#   config_datascience_results.yaml   datascience_results routes
+#   config_cv_survivability.yaml               (1) alive/dead classification
+#   config_cv_content_tagging.yaml             (2) content tagging of photo evidence
+#   config_cv_content_moderation.yaml          (3) AI content moderation (AICM)
+#   config_cv_verification_summarization.yaml  (4) planting partners summarization
+#   config_datascience_results.yaml            datascience_results routes
 #
 # Every top-level key must be unique across all three files.
 
@@ -16,14 +19,12 @@ repo:
   description:  'Unified veritree datascience API: computer vision inference and analytics results'
   version:      '0.1.0'
 
-directories:
-  data_input:   'data/data_input'
-  data_output:  'data/data_output'
-
 api_config:
-  local_data_input_dir:   "/api/data_input/"
-  local_data_output_dir:  "/api/data_output/"
-  s3_destination_basedir: "survivability"
-  push_logs_to_s3: False
   host: '0.0.0.0'
   port: 8000
+
+logging:
+  filename:     'veritree_datascience_service.log'
+  level:        'INFO'
+  max_bytes:    10485760   # 10 MB per file
+  backup_count: 5          # keep 5 rotations -> 60 MB ceiling on disk

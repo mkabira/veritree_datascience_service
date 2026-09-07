@@ -19,7 +19,9 @@ async def api_authentication(token: str = Depends(APIKeyHeader(name='Token'))):
     Kept on the `Token` header (rather than a bearer scheme) for wire-compatibility
     with the deployed survivability clients.
 
-    :token str: token string for authentication
+    :param token: value of the request's ``Token`` header
+    :return: None when the token is valid
+    :raises HTTPException: 401 when the token is missing or does not match
     """
 
     if token != os.getenv("API_ENDPOINT_TOKEN"):

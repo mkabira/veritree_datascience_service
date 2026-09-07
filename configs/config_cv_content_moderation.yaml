@@ -1,135 +1,12 @@
-# config_computer_vision.yaml
+# config_cv_content_moderation.yaml
 #
-# Ported verbatim from veritree-survivability :: configs/config.yaml
-# Owns: mangrove detection/classification pipeline, L3 verification tagging,
-#       AI content moderation (AICM) and verification summarization.
+# (3) AI COMPUTER VISION CONTENT MODERATION
+#
+# AICM triage layer flagging field photos that need human review before publication.
+# Serves: POST /computer_vision/content_moderation/, and is chained automatically
+# from /computer_vision/content_tagging/ whenever `people` is detected.
+# Source: veritree-survivability :: configs/config.yaml
 
-pipeline:
-  object_model_path:    '/src/models/mangrove_detection_model/mangrove_detection_model.pt'
-  survival_model_path:  '/src/models/mangrove_classification_model/model.save'
-  image_path:           '/src/data/survivability_inference/local'
-  confidence:           0.4
-  classes_path:         '/configs/classes.yaml' #classes.yaml
-  results_csv_path:     null
-  save_dir:             '/src/data/survivability_inference/results'
-  save_cropped_mangroves: False
-
-
-pipeline_meta:
-  border:       400
-  pad_fraction: 0.25
-  min_size:     50
-  input_width:  224
-  input_height: 224
-
-
-classes:
-  Alive:        [[1.0, 0.0, 0.0], 0]
-  Dead/dormant: [[0.0, 1.0, 0.0], 1]
-  Unclear:      [[0.0, 0.0, 1.0], 2]
-
-
-### COMPUTER VISION L3-VERIFICATION CONFIGURATIONS
-l3_verification_cvmodel:
-  model_name: 'ViT-B-32'
-  pretrained: 'laion2b_s34b_b79k'
-  model_path: ''
-  verification_tags:
-      people: [
-        "a photo of a person or people in a planting field",
-        "a person working in a muddy field doing some planting",
-        "a photo of a person in a planting field",
-      ]
-      meterstick: [
-          "a meter stick"
-      ]
-  verification_thresholds:
-    people:     0.25
-    meterstick: 0.25
-
-l3_verification_gemini:
-  model_name: 'gemini-3-pro-image-preview'
-  system_prompt: "You are an advanced vision classifier for agricultural and sustainability applications.
-                  Your task is to perform object detection to determine if certain objects are in a photo.
-                  You must return JSON with probability from 0.0 to 1.0"
-  verification_tags:
-      people: "Is there a person in this image? A person can be in the form of a human silhouette, hands, legs, head, face"
-      meterstick: "Is there a meterstick in this image? A meterstick is mostly laid flat on the ground in a planting or muddy field"
-  verification_threshold: 0.8
-
-l3_verification_openai:
-  model_name: 'gpt-5.4'
-  system_prompt: "You are an advanced vision classifier for agricultural and sustainability applications.
-                  Your task is to perform object detection to determine if certain objects are in a photo.
-                  You must return JSON with probability from 0.0 to 1.0"
-  verification_tags:
-      people: "Is there a person in this image? A person can be in the form of a human silhouette, hands, legs, head, face"
-      meterstick: "Is there a meterstick in this image? A meterstick is mostly laid flat on the ground in a planting or muddy field"
-  verification_threshold: 0.8
-
-l3_verification_anthropic:
-  model_name: 'claude-sonnet-4-6'
-  system_prompt: "You are an advanced vision classifier for agricultural and sustainability applications.
-                  Your task is to perform object detection to determine if certain objects are in a photo.
-                  You must return JSON with probability from 0.0 to 1.0"
-  verification_tags:
-      people: "Is there a person in this image? A person can be in the form of a human silhouette, hands, legs, head, face"
-      meterstick: "Is there a meterstick in this image? A meterstick is mostly laid flat on the ground in a planting or muddy field"
-  verification_threshold: 0.8
-
-
-### L3-VERIFICATION PLANTING PARTNERS SUMMARIZATION
-verification_summarization:
-  model: "claude"
-  # model: "gpt-4o" #model versions were hardcoded as PROVIDER_ALIASES; refactor src/libs/utils to use specific model types
-  temperature: 0.2
-  system_prompt: >
-    You are a supervisor reviewing field planting verification data for a tree planting project.
-    Your role is to convert raw rule failure data into clear, actionable messages for the field team.
-    Every message MUST tell the field team exactly what action they need to take to pass the check —
-    not just what went wrong, but what to do to fix it. Be direct and specific.
-    Do not use markdown, bullet points, or headers. Write one plain-language sentence per rule.
-  user_prompt_template: >
-    Below are verification rules for a planting session submission.
-    Convert each failed rule into a short, actionable message for the field team that tells them
-    exactly what they need to do to pass the check.
-    Return a JSON array only — no extra text, no markdown, no code fences.
-    Each item must have "rule_public_id" and "message".
-
-    The failure_reason field is a structured object. Interpret it as follows:
-
-    type "simple", operator "not_null":
-      → "{{fact_name}} is missing — add it to the planting session."
-
-    type "simple", operator "between":
-      → "{{fact_name}} must be between {{min}} and {{max}} — update it to a value in that range."
-
-    type "quantified", quantifier "at_least":
-      → "Submit at least {{diff}} more {{fact_name}} — only {{found}} of the {{required}} required have been submitted."
-
-    type "quantified", quantifier "percentage":
-      → "At least {{required_pct}}% of {{fact_name}} must meet the criteria — currently only {{actual_pct}}% do ({{found}} out of {{total}} submitted)."
-
-    If failure_reason is null, use the rule name and comments to write a message that tells the field
-    team what action to take. Be specific about what they need to do based on the rule name and any comments.
-    If there are multiple comments, combine them into one sentence if possible; otherwise write two sentences.
-
-    Failed rules:
-    {failed_rules}
-
-    Example input:
-    [
-      {{"rule_public_id": "rule_abc", "name": "Photos required", "status": "failed", "failure_reason": {{"type": "quantified", "fact_name": "Photos", "quantifier": "at_least", "found": 3, "required": 20, "diff": 17}}, "comments": []}},
-      {{"rule_public_id": "rule_def", "name": "Planting date valid", "status": "failed", "failure_reason": {{"type": "simple", "fact_name": "Planting date", "operator": "not_null"}}, "comments": []}}
-    ]
-
-    Example output:
-    [{{"rule_public_id": "rule_abc", "message": "Submit at least 17 more Photos — only 3 of the 20 required have been submitted."}}, {{"rule_public_id": "rule_def", "message": "Planting date is missing — add it to the planting session."}}]
-
-    Now generate the JSON array for the rules above.
-    
-
-### AI COMPUTER VISION CONTENT MODERATION
 # NOTE: this classifier is called via a forced `record_detection` tool call
 # (see src/libs/veritag.py). Only two fields flow through the pipeline:
 #   detection (bool) and probability (float 0-1); the flag fires when
@@ -245,3 +122,4 @@ aicm_anthropic:
   # Calibrated on 51 confirmed minors vs 288 confirmed (hard) non-minors:
   #   @0.20 -> recall 0.73, FPR 0.41 (vs old prompt recall 0.86 / FPR 0.63).
   #   Chosen operating point: favours recall while cutting false positives.
+  verification_threshold: 0.20

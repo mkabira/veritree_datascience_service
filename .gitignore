@@ -225,16 +225,11 @@ credentials.json
 *.credentials.json
 service_account*.json
 
-# Runtime scratch space for the computer_vision routes (kept, contents ignored)
-api/data_input/*
-api/data_output/*
-!api/data_input/.gitkeep
-!api/data_output/.gitkeep
-data/data_input/*
-data/data_output/*
-!data/data_input/.gitkeep
-!data/data_output/.gitkeep
-src/data/survivability_inference/local/*
-src/data/survivability_inference/results/*
-!src/data/survivability_inference/local/.gitkeep
-!src/data/survivability_inference/results/.gitkeep
+# The service performs no local file I/O: images are read from S3 into memory and
+# results are returned as JSON, so there is no scratch space to ignore.
+
+# macOS Finder metadata
+.DS_Store
+
+# JetBrains project config: contains a machine-specific interpreter path
+.idea/

@@ -1,56 +1,47 @@
+"""
+Anthropic vision classification for field photo evidence.
+
+Loads an image, encodes it for the Messages API, and asks the model for a calibrated
+probability per candidate tag via a forced ``record_detection`` tool call. Only the
+detection flag and its probability cross the boundary, so the caller compares against
+a single threshold.
+
+Anthropic is the only backend: the OpenCLIP, Gemini and OpenAI taggers this module
+once carried were retired once Anthropic was measured as the best performer on
+veritree field photos.
+
+Consumed by src/services/computer_vision/content_tagging.py.
+"""
+
 import base64
 import io
 import os
-import json
-import uuid
-
-from urllib.parse import urlparse
 
 import requests
-import torch
-
-import open_clip
-import numpy as np
 
 from anthropic import Anthropic
-from google import genai
-from openai import OpenAI
-
-from google.genai import types
-from pydantic import BaseModel
-
-from io import BytesIO
 from PIL import Image
 
 from src.utils import context
+
 
 config = context.config
 logger = context.logger
 
 
-def load_openclip(model_name, pretrained):
-    """
-    Setup OpenClip classification model
-    :param model_name:
-    :param pretrained:
-    :return:
-    """
-
-    model, _, preprocess = open_clip.create_model_and_transforms(model_name=model_name, pretrained=pretrained)
-    tokenizer = open_clip.get_tokenizer(model_name)
-    return model, preprocess, tokenizer
-
-
 def load_photo(url, show=False):
     """
-    Load image from url (veritreephotos public endpoint)
-    :param url:
-    :return:
+    Fetch an image over HTTP and return it as RGB.
+
+    :param url: URL of the image, e.g. the veritreephotos public endpoint
+    :param show: open the image in the default viewer, for interactive use
+    :return: the loaded PIL image
+    :raises requests.HTTPError: if the URL returns a non-2xx status
     """
 
     response = requests.get(url)
     response.raise_for_status()
-    img = Image.open(BytesIO(response.content)).convert("RGB")
+    img = Image.open(io.BytesIO(response.content)).convert("RGB")
 
     if show:
         img.show()
@@ -58,349 +49,36 @@ def load_photo(url, show=False):
     return img
 
 
-def load_photo_b64(image_path, bool_encode=True):
-    """
-    Load image from url with base64 encoding support
-    :param image_path:
-    :return:
-    """
-
-    if image_path.startswith("http"):
-        response = requests.get(image_path)
-        output = Image.open(io.BytesIO(response.content)).convert("RGB")
-    else:
-        output = Image.open(image_path).convert("RGB")
-
-    if bool_encode:
-        # Convert PIL image to base64
-        buffered = io.BytesIO()
-        output.save(buffered, format="JPEG")
-        output = base64.b64encode(buffered.getvalue()).decode()
-
-    return output
-
-
-def save_photos(url, save_dir, autoname=False):
-
-    # Create directory if it doesn't exist
-    os.makedirs(save_dir, exist_ok=True)
-
-    # Extract filename from URL
-    parsed_url = urlparse(url)
-    filename = os.path.basename(parsed_url.path)
-
-    # Fallback filename if URL doesn't contain one
-    if not filename:
-        rand_id = uuid.uuid4()
-        filename = f"downloaded_image_{rand_id}.jpg"
-
-    if autoname:
-        rand_id = uuid.uuid4()
-        filename = f"downloaded_image_{rand_id}.jpg"
-
-    file_path = os.path.join(save_dir, filename)
-
-    try:
-        # Stream download to handle large files
-        response = requests.get(url, stream=True)
-        response.raise_for_status()
-
-        with open(file_path, "wb") as f:
-            for chunk in response.iter_content(chunk_size=8192):
-                if chunk:
-                    f.write(chunk)
-
-        print(f"Image saved to: {file_path}")
-        return file_path
-
-    except requests.exceptions.RequestException as e:
-        print(f"Error downloading image: {e}")
-        return None
-
-
-def build_text_features(labels_dict, model, tokenizer):
-    """
-    Build text features based on labels dictionary.
-    :param labels_dict:
-    :param model:
-    :param tokenizer:
-    :return:
-    """
-
-    label_keys = list(labels_dict.keys())
-    all_features = []
-
-    for key in label_keys:
-        prompts = labels_dict[key]
-        text_tokens = tokenizer(prompts)
-        with torch.no_grad():
-            features = model.encode_text(text_tokens)
-            features /= features.norm(dim=-1, keepdim=True)
-            features = features.mean(dim=0, keepdim=True)
-            all_features.append(features)
-
-    text_features = torch.cat(all_features, dim=0)
-    return label_keys, text_features
-
-
-def classify_image_multi(image_path, preprocess, model, label_keys, text_features, thresholds=None):
-    """
-    Classify an image against multiple labels with per-label thresholds.
-
-    Args:
-        image_path (str): Path to the image file (of the form: 'https://veritreephotos.s3...' or local path)
-        preprocess (obj): Preprocessing project
-        model (obj): Model object for CLIP classification
-        label_keys (list): List of label keys
-        text_features (torch.Tensor): Precomputed text embeddings for labels
-        thresholds (dict, optional): Per-label threshold, e.g., {"seedling":0.25,...}
-                                     If None, default threshold 0.255 is used for all.
-
-    Returns:
-        dict: {label: similarity_score} for all labels above threshold,
-              or {"": max_score} if there are no matches
-    """
-
-    if thresholds is None:
-        thresholds = {k: 0.255 for k in label_keys}
-
-    try:
-        if 'http' in image_path:
-            img_obj = load_photo(image_path)
-            image = preprocess(img_obj).unsqueeze(0)
-        else:
-            image = preprocess(Image.open(image_path).convert("RGB")).unsqueeze(0)
-    except Exception as e:
-        logger.error(f"Error: unable to load verification photo: {e}")
-
-    with torch.no_grad():
-        image_features = model.encode_image(image)
-        image_features /= image_features.norm(dim=-1, keepdim=True)
-        similarity = (image_features @ text_features.T).squeeze(0)
-
-    similarity = similarity.cpu().numpy()
-    similarity = np.round(similarity, 5)
-
-    dict_scores = {}
-    matches = {}
-    for i, label in enumerate(label_keys):
-        if similarity[i] >= thresholds.get(label, 0.25):
-            matches[label] = similarity[i]
-        dict_scores[label] = similarity[i]
-
-    if not matches:
-        max_idx = similarity.argmax()
-        matches = {"": similarity[max_idx]}
-
-    return matches, dict_scores
-
-
-def load_gemini_client(api_key=os.getenv("GOOGLE_AI_STUDIO_API_KEY")):
-    """
-    Startup Google-Gemini API client
-    :return:
-    """
-    client = genai.Client(api_key=api_key)
-    return client
-
-
-def load_openai_client(api_key=os.getenv("OPENAI_API_KEY")):
-    """
-    Startup OpenAI-GPT API client
-    :return:
-    """
-    client = OpenAI(api_key=api_key)
-    return client
-
-
 def load_anthropic_client(api_key=os.getenv("ANTHROPIC_API_KEY")):
     """
-    Startup Anthropic-Claude API client
-    :return:
+    Construct the Anthropic API client.
+
+    :param api_key: Anthropic API key; defaults to $ANTHROPIC_API_KEY read at import
+    :return: a configured Anthropic client
     """
     client = Anthropic(api_key=api_key)
     return client
 
 
-def classify_image_gemini(client, model_name, image_path, tag_names, system_prompt, threshold):
+def classify_image_anthropic(client, model_name, image, tag_names, system_prompt, threshold):
     """
-    Classify an image against several tag_names using gemini AI model.
-    :param client:
-    :param model_name:
-    :param image_path:
-    :param tag_names:
-    :param system_prompt:
-    :param threshold:
-    :return:
-    """
+    Classify an already-loaded image against several tag names.
 
-    # client = genai.Client(api_key=os.getenv("GOOGLE_AI_STUDIO_API_KEY"))
-
-    class Detection(BaseModel):
-        detection: bool
-        probability: float
-
-    try:
-        if 'http' in image_path:
-            image = load_photo(image_path)
-        else:
-            image = Image.open(image_path).convert("RGB")
-    except Exception as e:
-        logger.error(f"Error: unable to load verification photo: {e}")
-
-    matches = {}
-
-    for i_tag_name in tag_names.keys():
-
-        query_prompt = tag_names[i_tag_name]
-
-        response = client.models.generate_content(
-            model=model_name,
-            contents=[query_prompt, image],
-            config=types.GenerateContentConfig(
-                system_instruction=system_prompt,
-                response_mime_type="application/json",
-                response_schema=Detection
-            )
-        )
-
-        result = response.parsed
-
-        if result.probability > threshold:
-            matches[i_tag_name] = result.probability
-
-    return matches
-
-
-def classify_image_gemini(client, model_name, image_path, tag_names, system_prompt, threshold):
-    """
-    Classify an image against several tag_names using gemini AI model.
-    :param client:
-    :param model_name:
-    :param image_path:
-    :param tag_names:
-    :param system_prompt:
-    :param threshold:
-    :return:
-    """
-
-    # client = genai.Client(api_key=os.getenv("GOOGLE_AI_STUDIO_API_KEY"))
-
-    class Detection(BaseModel):
-        detection: bool
-        probability: float
-
-    try:
-        if 'http' in image_path:
-            image = load_photo(image_path)
-        else:
-            image = Image.open(image_path).convert("RGB")
-    except Exception as e:
-        logger.error(f"Error: unable to load verification photo: {e}")
-
-    matches = {}
-
-    for i_tag_name in tag_names.keys():
-
-        query_prompt = tag_names[i_tag_name]
-
-        response = client.models.generate_content(
-            model=model_name,
-            contents=[query_prompt, image],
-            config=types.GenerateContentConfig(
-                system_instruction=system_prompt,
-                response_mime_type="application/json",
-                response_schema=Detection
-            )
-        )
-
-        result = response.parsed
-
-        if result.probability > threshold:
-            matches[i_tag_name] = result.probability
-
-    return matches
-
-
-def classify_image_openai(client, model_name, image_path, tag_names, system_prompt, threshold):
-    """
-    Classify an image against several tag_names using OpenAI model.
-    :param client:
-    :param model_name:
-    :param image_path:
-    :param tag_names:
-    :param system_prompt:
-    :param threshold:
-    :return:
-    """
-
-    class Detection(BaseModel):
-        detection: bool
-        probability: float
-
-    try:
-        image_b64 = load_photo_b64(image_path)
-    except Exception as e:
-        logger.error(f"Error: unable to load verification photo: {e}")
-        return {}
-
-    matches = {}
-
-    for tag_key, query_prompt in tag_names.items():
-
-        response = client.responses.parse(
-            model=model_name,
-            input=[
-                {
-                    "role": "system",
-                    "content": system_prompt
-                },
-                {
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "input_text",
-                            "text": query_prompt
-                        },
-                        {
-                            "type": "input_image",
-                            "image_url": f"data:image/jpeg;base64,{image_b64}"
-                        }
-                    ]
-                }
-            ],
-            text_format=Detection
-        )
-
-        result = response.output_parsed
-
-        if result and result.probability > threshold:
-            matches[tag_key] = result.probability
-
-    return matches
-
-
-def classify_image_anthropic(client, model_name, image_path, tag_names, system_prompt, threshold):
-    """
-    Classify an image against several tag_names using the Anthropic Claude API.
+    Takes a PIL image rather than a path so the caller owns image loading: the
+    computer_vision route reads the source once and hands the same decoded image to
+    whichever service was requested, instead of each classifier re-fetching it.
 
     :param client: anthropic.Anthropic() client instance
-    :param model_name: e.g. 'claude-3-5-sonnet-20241022'
-    :param image_path: URL or local file path
-    :param tag_names: dict of tag names and their corresponding prompts
-    :param system_prompt: System instruction text
-    :param threshold: float probability threshold
-    :return: dict of matches and their probabilities
+    :param model_name: Anthropic model identifier
+    :param image: PIL image to classify
+    :param tag_names: mapping of tag name to the question describing it
+    :param system_prompt: system instruction text
+    :param threshold: minimum probability for a tag to be reported
+    :return: mapping of each tag above the threshold to its probability
     """
 
     try:
-        if 'http' in image_path:
-            image = load_photo(image_path)
-        else:
-            image = Image.open(image_path).convert("RGB")
-
-        # Claude requires a base64 encoded string and a specific media type.
-        # Also ensure it's RGB and save it to an in-memory buffer as a JPEG.
+        # Claude takes the image inline as base64 with an explicit media type.
         if image.mode != "RGB":
             image = image.convert("RGB")
 
@@ -410,7 +88,7 @@ def classify_image_anthropic(client, model_name, image_path, tag_names, system_p
         media_type = "image/jpeg"
 
     except Exception as e:
-        logger.error(f"Error: unable to load verification photo: {e}")
+        logger.error(f"Error: unable to encode verification photo: {e}")
         return {}
 
     matches = {}

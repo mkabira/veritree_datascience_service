@@ -1,0 +1,59 @@
+# config_cv_verification_summarization.yaml
+#
+# (4) L3-VERIFICATION PLANTING PARTNERS SUMMARIZATION
+#
+# Turns raw verification rule failures into plain-language flag messages for the
+# field team. NOT YET EXPOSED as a route in this service -- the config and the
+# llm_chat() helper it needs were carried over, but the endpoint itself still
+# lives in veritree-survivability :: api/surv_endpoint.py.
+# Source: veritree-survivability :: configs/config.yaml
+
+verification_summarization:
+  model: "claude"
+  # model: "gpt-4o" #model versions were hardcoded as PROVIDER_ALIASES; refactor src/libs/utils to use specific model types
+  temperature: 0.2
+  system_prompt: >
+    You are a supervisor reviewing field planting verification data for a tree planting project.
+    Your role is to convert raw rule failure data into clear, actionable messages for the field team.
+    Every message MUST tell the field team exactly what action they need to take to pass the check —
+    not just what went wrong, but what to do to fix it. Be direct and specific.
+    Do not use markdown, bullet points, or headers. Write one plain-language sentence per rule.
+  user_prompt_template: >
+    Below are verification rules for a planting session submission.
+    Convert each failed rule into a short, actionable message for the field team that tells them
+    exactly what they need to do to pass the check.
+    Return a JSON array only — no extra text, no markdown, no code fences.
+    Each item must have "rule_public_id" and "message".
+
+    The failure_reason field is a structured object. Interpret it as follows:
+
+    type "simple", operator "not_null":
+      → "{{fact_name}} is missing — add it to the planting session."
+
+    type "simple", operator "between":
+      → "{{fact_name}} must be between {{min}} and {{max}} — update it to a value in that range."
+
+    type "quantified", quantifier "at_least":
+      → "Submit at least {{diff}} more {{fact_name}} — only {{found}} of the {{required}} required have been submitted."
+
+    type "quantified", quantifier "percentage":
+      → "At least {{required_pct}}% of {{fact_name}} must meet the criteria — currently only {{actual_pct}}% do ({{found}} out of {{total}} submitted)."
+
+    If failure_reason is null, use the rule name and comments to write a message that tells the field
+    team what action to take. Be specific about what they need to do based on the rule name and any comments.
+    If there are multiple comments, combine them into one sentence if possible; otherwise write two sentences.
+
+    Failed rules:
+    {failed_rules}
+
+    Example input:
+    [
+      {{"rule_public_id": "rule_abc", "name": "Photos required", "status": "failed", "failure_reason": {{"type": "quantified", "fact_name": "Photos", "quantifier": "at_least", "found": 3, "required": 20, "diff": 17}}, "comments": []}},
+      {{"rule_public_id": "rule_def", "name": "Planting date valid", "status": "failed", "failure_reason": {{"type": "simple", "fact_name": "Planting date", "operator": "not_null"}}, "comments": []}}
+    ]
+
+    Example output:
+    [{{"rule_public_id": "rule_abc", "message": "Submit at least 17 more Photos — only 3 of the 20 required have been submitted."}}, {{"rule_public_id": "rule_def", "message": "Planting date is missing — add it to the planting session."}}]
+
+    Now generate the JSON array for the rules above.
+    

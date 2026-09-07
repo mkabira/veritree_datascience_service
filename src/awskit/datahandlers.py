@@ -1,7 +1,18 @@
+"""
+Connection handlers for the AWS services the API depends on.
+
+Exposes an S3 reader for inbound field photos and a shared SQLAlchemy engine for the
+analytics Postgres instance. Both are configured for long-running server use: the
+database pool recycles and health-checks connections, and the S3 client retries
+transient errors rather than surfacing them as request failures.
+"""
+
 import os
 
 import boto3
+from botocore.config import Config as BotocoreConfig
 from sqlalchemy import create_engine
+from sqlalchemy.engine import URL
 
 from src.utils import context
 
@@ -10,142 +21,153 @@ config = context.config
 logger = context.logger
 
 
+# Retry transient S3 faults (throttling, 5xx) before failing a request. Standard mode
+# covers the connection-level errors that adaptive mode's client-side rate limiting
+# would otherwise mask behind added latency.
+S3_CLIENT_CONFIG = BotocoreConfig(
+    retries={'max_attempts': 3, 'mode': 'standard'},
+    connect_timeout=5,
+    read_timeout=30,
+)
+
+# RDS terminates idle connections, and a pooled connection handed out after that has
+# happened fails the request. pre_ping validates on checkout, recycle caps connection
+# age below any server-side idle timeout.
+DB_POOL_SETTINGS = {
+    'pool_size': 5,
+    'max_overflow': 5,
+    'pool_pre_ping': True,
+    'pool_recycle': 1800,
+    'pool_timeout': 30,
+}
+
+DB_CONNECT_TIMEOUT_SECONDS = 10
+
+# Bound any single query server-side so one pathological request cannot hold a
+# connection open indefinitely.
+DB_STATEMENT_TIMEOUT_MS = 30_000
+
+
 class S3StorageHandler:
     """
-    Connection handler for an S3 bucket.
+    Read-only connection handler for a single S3 bucket.
 
-    Merged from the survivability service (IAM/prod_mode branch, used by the deployed
-    ECS task) and the multispectral foresthealth pipeline (extension-filtered listing
-    used for raster discovery).
+    The service reads source images and writes nothing back, so only :meth:`read_bytes`
+    is exposed. Construction never raises: a bucket that cannot be reached leaves the
+    handler unconnected and reads fail per-request, so a misconfigured computer_vision
+    bucket does not stop the datascience_results routes from serving.
     """
 
-    def __init__(self, aws_bucketname, aws_accesskey, aws_secretkey, aws_regionname, prod_mode=False):
+    def __init__(self, aws_bucketname, aws_accesskey, aws_secretkey, aws_regionname,
+                 prod_mode=False):
+        """
+        Open a session against the named bucket.
+
+        :param aws_bucketname: bucket to read from
+        :param aws_accesskey: access key id, ignored when prod_mode is True
+        :param aws_secretkey: secret access key, ignored when prod_mode is True
+        :param aws_regionname: region, ignored when prod_mode is True
+        :param prod_mode: when True authenticate via the ambient credential chain
+            (the ECS task role) instead of explicit keys
+        """
 
         self.bucket_name = aws_bucketname
         self.s3_bucket = None
 
         try:
             if prod_mode:
-                # Use IAM connection if in PROD mode (based on ECS definitions)
+                # Resolve credentials from the ambient chain: the ECS task role in
+                # deployment, environment variables locally.
                 session = boto3.Session()
             else:
-                # Use secret keys and access keys from ENV variables otherwise esp in DEV mode
                 session = boto3.Session(aws_access_key_id=aws_accesskey,
                                         aws_secret_access_key=aws_secretkey,
                                         region_name=aws_regionname)
 
-            self.s3_bucket = session.resource('s3').Bucket(aws_bucketname)
+            self.s3_bucket = session.resource('s3', config=S3_CLIENT_CONFIG).Bucket(aws_bucketname)
             logger.info(f"Created connection to AWS Storage bucket: {aws_bucketname}")
 
         except Exception as e:
-            # Boot is not aborted: a service that only serves datascience_results does not
-            # need every CV bucket configured. connected() lets callers check before use.
-            logger.error(f'Unable to connect to AWS Storage bucket: {aws_bucketname} due to: {e}')
+            logger.error(f"Unable to connect to AWS Storage bucket: {aws_bucketname} due to: {e}")
 
     def connected(self) -> bool:
-        """Whether this handler holds a usable bucket resource."""
+        """
+        Whether the handler holds a usable bucket resource.
+
+        :return: True when reads can be attempted
+        """
+
         return self.s3_bucket is not None
 
-    def listall(self, ):
+    def read_bytes(self, location_source: str) -> bytes:
         """
-        List all objects in the bucket
-        """
-        for obj in self.s3_bucket.objects.all():
-            print(obj.key)
-        pass
+        Read an object straight into memory, without a temporary file.
 
-    def upload(self, location_source, location_destination):
-        """
-        Upload a file to the S3 Bucket using src and dst paths
-        # location_source = 'test/test_downloaded.csv'
-        # location_destination = 'test/test_uploaded.csv'
+        :param location_source: object key, e.g. 'survivability/org_1/img.jpg'
+        :return: the object's raw bytes
+        :raises RuntimeError: if the handler never connected to its bucket
         """
 
-        self.s3_bucket.upload_file(location_source, location_destination)
-        # TODO: Add a check if file now exists in destination and return T/F
-        return None
+        if not self.connected():
+            raise RuntimeError(f"S3 bucket '{self.bucket_name}' is not connected")
 
-    def download(self, location_source, location_destination):
-        """
-        Download a file to the S3 Bucket using src and dst paths
-        # location_source = 'test_uploaded.csv'
-        # location_destination = './test_downloaded.csv'
-        """
-
-        self.s3_bucket.download_file(location_source, location_destination)
-        # TODO: Add a check if file now exists in destination and return T/F
-        return None
-
-    def list_objects(self, basepath='survivability/'):
-        """
-        Returns a list of eligible image objects in the S3 bucket base path
-        """
-
-        list_objects = []
-
-        for objects in self.s3_bucket.objects.filter(Prefix=basepath):
-            if objects.key.endswith(('.png', '.PNG', 'jpg', 'JPG', 'jpeg', 'JPEG')):
-                list_objects.append(objects.key)
-
-        return list_objects
-
-    def list_objects_by_extension(self, basepath='', extensions=('.tif',)):
-        """
-        Returns a list of object keys under a prefix filtered by file extension
-        """
-
-        list_keys = []
-
-        for objects in self.s3_bucket.objects.filter(Prefix=basepath):
-            if objects.key.endswith(tuple(extensions)):
-                list_keys.append(objects.key)
-
-        return list_keys
+        return self.s3_bucket.Object(location_source).get()['Body'].read()
 
 
 class RDSPostgresHandler:
+    """
+    SQLAlchemy engine for the analytics Postgres instance.
+
+    The engine is lazy: constructing it opens no socket, so the service starts even
+    when the database is unreachable and only the datascience_results routes fail.
+    """
 
     def __init__(self, host, port, database, user, password):
-        self.engine = create_engine(f"postgresql://{user}:{password}@{host}:{port}/{database}")
-        logger.info(f"Creating connection to RDS Postgres database: {database}")
-
-    def get_engine(self, ):
         """
-        Get engine connection for Postgres RDS service using SQLAlchemy
+        Build a pooled engine for the given instance.
+
+        Credentials are passed to :meth:`sqlalchemy.engine.URL.create` rather than
+        interpolated into a URL string: it escapes reserved characters, so a password
+        containing '@', '/', ':' or '#' connects correctly instead of misparsing, and
+        the resulting URL masks the password when logged or repr'd.
+
+        :param host: RDS endpoint hostname
+        :param port: port; coerced to int, defaulting to 5432 when unset
+        :param database: database name
+        :param user: database user
+        :param password: database password
         """
-        return self.engine
+
+        url = URL.create(
+            drivername="postgresql+psycopg2",
+            username=user,
+            password=password,
+            host=host,
+            port=int(port) if port else 5432,
+            database=database,
+        )
+
+        self.engine = create_engine(
+            url,
+            connect_args={
+                'connect_timeout': DB_CONNECT_TIMEOUT_SECONDS,
+                'options': f'-c statement_timeout={DB_STATEMENT_TIMEOUT_MS}',
+                'application_name': config.repo.name,
+            },
+            **DB_POOL_SETTINGS,
+        )
+
+        # url renders the password as *** -- safe to log.
+        logger.info(f"Configured RDS Postgres engine: {url.render_as_string()}")
 
 
-# ---------------------------------------------------------------------------
-# Shared handlers
-#
-# The datascience_results routers read from a single analytics Postgres instance,
-# so one module-level pg_handler is shared. The computer_vision routers talk to
-# TWO different buckets (a partner-owned source bucket and a veritree-owned
-# destination bucket), so those handlers are constructed in the router itself
-# from AWS_SOURCE_* / AWS_DESTINATION_* rather than the single-bucket vars below.
-# ---------------------------------------------------------------------------
-
-s3_handler = S3StorageHandler(
-    aws_bucketname=os.getenv("AWS_S3_BUCKET_NAME"),
-    aws_accesskey=os.getenv("AWS_ACCESS_KEY_ID"),
-    aws_secretkey=os.getenv("AWS_SECRET_ACCESS_KEY"),
-    aws_regionname=os.getenv("AWS_S3_REGION_NAME"),
-    prod_mode=config.prod_mode
-)
-
-if s3_handler.connected():
-    logger.info(f"Connected to S3 bucket: {s3_handler.bucket_name}")
-else:
-    logger.warning("S3 handler unavailable; routes that read or write S3 will fail")
-
-
+# One shared engine backs the datascience_results routes. S3 handlers are constructed
+# per-router instead: only computer_vision needs one, and it authenticates with the
+# AWS_SOURCE_* credentials rather than the default chain.
 pg_handler = RDSPostgresHandler(
     host=os.getenv("AWS_RDS_ENDPOINT"),
     port=os.getenv("AWS_RDS_PORT"),
     database=os.getenv("AWS_RDS_DB"),
     user=os.getenv("AWS_RDS_USER_NAME"),
-    password=os.getenv("AWS_RDS_PASSWORD")
+    password=os.getenv("AWS_RDS_PASSWORD"),
 )
-
-logger.info("Connected to Postgres")

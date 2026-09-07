@@ -1,0 +1,19 @@
+# config_cv_content_tagging.yaml
+#
+# (2) COMPUTER VISION CONTENT TAGGING CONFIGURATIONS
+#
+# Tagging of field photo evidence (people, meterstick, ...) for L3 verification.
+# Anthropic is the only backend: it measured best on veritree field photos, so the
+# OpenCLIP (cvmodel), Gemini and OpenAI blocks were retired.
+# Serves: POST /computer_vision/content_tagging/
+# Source: veritree-survivability :: configs/config.yaml
+
+content_tagging_anthropic:
+  model_name: 'claude-sonnet-4-6'
+  system_prompt: "You are an advanced vision classifier for agricultural and sustainability applications.
+                  Your task is to perform object detection to determine if certain objects are in a photo.
+                  You must return JSON with probability from 0.0 to 1.0"
+  verification_tags:
+      people: "Is there a person in this image? A person can be in the form of a human silhouette, hands, legs, head, face"
+      meterstick: "Is there a meterstick in this image? A meterstick is mostly laid flat on the ground in a planting or muddy field"
+  verification_threshold: 0.8
