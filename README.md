@@ -512,6 +512,29 @@ The image is Python 3.11-slim, multi-stage, and runs
 `python3 src/main.py pipeline pipeline_api` — the task/pipeline contract the ECS task
 definitions invoke, shared with the other veritree datascience repositories.
 
+### The CLI
+
+```bash
+python3 src/main.py --help              # subcommands
+python3 src/main.py list                # registered tasks and pipelines
+python3 src/main.py task task_launch_api
+python3 src/main.py pipeline pipeline_api
+```
+
+A *task* is one unit of work; a *pipeline* is an ordered list of tasks. Add scheduled
+work to the `TASKS` and `PIPELINES` registries in `src/main.py`.
+
+Unknown names, missing arguments and failing tasks all exit **non-zero** with a
+readable message and no traceback — a container entry point that exits 0 having done
+nothing is worse than one that fails loudly.
+
+`task_launch_api` **replaces the process** via `os.execv`, so uvicorn becomes PID 1 and
+receives the SIGTERM that ECS sends on a deploy, draining in-flight requests instead of
+being force-killed after the stop timeout. It launches through `sys.executable -m
+uvicorn` rather than the `uvicorn` console script, which is only on `PATH` when the
+environment is activated. A pipeline may only list such a task last; anything after it
+would silently never run, and the CLI refuses that at startup.
+
 Point the target group's health check at `/health`.
 
 ---
@@ -526,20 +549,15 @@ These are real and worth knowing before a production rollout.
    peering, RDS Proxy, or an `ssh -L` sidecar). An in-process tunnel also means each
    uvicorn worker opens its own SSH session against the bastion.
 
-2. **`src/main.py` launches uvicorn with `subprocess.run`,** so SIGTERM reaches the
-   Python parent and never the server. On deploy the parent dies, uvicorn keeps serving
-   orphaned, and ECS force-kills after the stop timeout instead of draining. Replacing
-   `subprocess.run` with `os.execvp` fixes it and keeps the task-name contract.
-
-3. **Live scans are uncached and list the whole prefix.** Filters and paging apply after
+2. **Live scans are uncached and list the whole prefix.** Filters and paging apply after
    the listing, so a narrow query costs the same as a broad one. Fine at 87 rasters and
    400 tracker assets; before those grow, push filters into the S3 `Prefix` and add a
    short TTL cache.
 
-4. **`read_properties` on tree-tracker scans is an N+1** — one extra S3 GET per asset.
+3. **`read_properties` on tree-tracker scans is an N+1** — one extra S3 GET per asset.
    Off by default, which is right.
 
-5. **Database sources for `multispectral_results` and `treetracker_results` are not
+4. **Database sources for `multispectral_results` and `treetracker_results` are not
    implemented.** Both answer from S3. The accessors in `src/awskit/datastores.py` carry
    the wiring instructions for restoring them.
 
