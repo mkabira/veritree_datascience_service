@@ -25,7 +25,7 @@ async def api_authentication(token: str = Depends(APIKeyHeader(name='Token'))):
     """
 
     if token != os.getenv("API_ENDPOINT_TOKEN"):
-        logger.warning("Rejected request with invalid API token")
+        logger.warning("auth rejected: reason=invalid_token")
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED)
 
     return None

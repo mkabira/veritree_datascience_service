@@ -8,7 +8,7 @@ Route groups:
 """
 
 import os
-from datetime import datetime
+from datetime import datetime, timezone
 
 from fastapi import FastAPI
 from fastapi.openapi.docs import get_redoc_html, get_swagger_ui_html
@@ -26,29 +26,49 @@ logger = context.logger
 FAVICON_PATH = os.path.join(os.path.dirname(__file__), 'static', 'favicon.ico')
 
 
-# Rendered above the route list in /docs. Markdown is supported.
+# Rendered above the route list in /docs. Markdown is supported, but Swagger styles
+# table cells generously -- a table whose cells hold sentences renders several hundred
+# pixels tall -- so prose is kept in lists and tables are reserved for short values.
 API_DESCRIPTION = """
-Unified API for veritree datascience: computer vision over field photo evidence, and
-read access to results published by the analytics pipelines.
+Computer vision over field photo evidence, and read access to the results the
+veritree datascience pipelines produce.
 
-## Authentication
+---
+
+### Authentication
 
 Every route except `/` and `/health` requires a `Token` header:
 
-```
+```http
 Token: <API_ENDPOINT_TOKEN>
 ```
 
-In this page, click **Authorize** and paste the token once to have it sent with every
-*Try it out* request.
+Click **Authorize** above and paste the token once — Swagger then sends it with every
+*Try it out* request on this page.
 
-## Route groups
+---
 
-| Group | What it does |
-|---|---|
-| **computer_vision** | Runs a model over one image in S3. One endpoint; the `service` field selects the pipeline. |
-| **datascience_results** | Serves rows the upstream pipelines already published. Filtered and paged by the database. |
-| **analyses** | Per-request LLM analyses over a payload you supply. No image involved. |
+### Route groups
+
+**`computer_vision`** &nbsp;·&nbsp; one endpoint, three model pipelines, selected by a
+`service` field. Takes one image in S3.
+
+**`datascience_results`** &nbsp;·&nbsp; results from the upstream pipelines, read either
+from the analytics database or by scanning S3 directly (`live_scan=true`).
+
+**`analyses`** &nbsp;·&nbsp; per-request LLM analyses over a payload you supply. No image
+involved.
+
+---
+
+### Conventions
+
+- **Paging** — `limit` and `offset` on every list route. `n_records` is the total
+  matching your filters; `n_returned` is the size of this page.
+- **Filters** — all optional. Omitting one widens the result rather than narrowing it.
+- **Status codes** — `501` means a source is not available here (not implemented, or
+  not yet published upstream) rather than a fault; `502` means an upstream store —
+  S3 or the database — failed.
 """
 
 TAGS_METADATA = [
@@ -57,34 +77,52 @@ TAGS_METADATA = [
         "description": (
             "Model inference over a single field photo. One endpoint routes to three "
             "services via the **`service`** field:\n\n"
-            "- **`survivability_detection`** — detects mangroves and classifies each as "
-            "alive, dead or unclear. Returns bounding boxes and per-detection "
-            "probabilities so the client draws its own overlay.\n"
-            "- **`content_tagging`** — tags photo evidence for L3 verification "
-            "(`people`, `meterstick`, ...). Chains into moderation when people are present.\n"
-            "- **`content_moderation`** — flags images needing human review before "
-            "publication. A triage layer, never the final decision.\n\n"
-            "`image_url` accepts a bare **S3 object key** or an **`https://` URL** to the "
-            "same object. The image is read and decoded once per request and never "
-            "written back, so a photo is stored exactly once."
+            "| `service` | Does |\n"
+            "|---|---|\n"
+            "| `survivability_detection` | mangrove detection + alive/dead/unclear |\n"
+            "| `content_tagging` | L3 verification tags (`people`, `meterstick`, ...) |\n"
+            "| `content_moderation` | flags images needing human review |\n\n"
+            "**Addressing the image.** `image_url` takes a full `s3://bucket/key` URI, a "
+            "bare object key resolved against the configured source bucket, or an "
+            "`https://` URL fetched over HTTP.\n\n"
+            "**Cost model.** The image is read and decoded once per request whichever "
+            "service runs, and is never written back — a photo is stored exactly once. "
+            "Model weights load at startup, not per request.\n\n"
+            "**Chaining.** `content_tagging` routes into moderation automatically when it "
+            "detects `people`, and merges those tags into its own."
         ),
     },
     {
         "name": "datascience_results",
         "description": (
-            "Read-only access to results already written to the analytics database. "
-            "These routes compute nothing.\n\n"
-            "All filters are optional; `limit` and `offset` are applied by the database, "
-            "so a response is bounded by the page rather than the table. `n_records` is "
-            "the total matching the filters, `n_returned` the size of this page."
+            "Results the upstream pipelines produce. These routes compute nothing.\n\n"
+            "| Route | Source |\n"
+            "|---|---|\n"
+            "| `bioacoustics_results` | analytics database |\n"
+            "| `multispectral_results` | **`live_scan=true`** — S3 |\n"
+            "| `treetracker_results` | **`live_scan=true`** — S3 |\n\n"
+            "**Live scan.** Indexes the assets straight out of S3 instead of reading a "
+            "published table, so a result appears as soon as the pipeline writes it. The "
+            "response reports where rows came from in `source_type`. The database sources "
+            "for the two S3-backed routes are not implemented, so they answer `501` "
+            "without the flag.\n\n"
+            "**Paging.** Database reads apply `limit`/`offset` in SQL alongside a count, "
+            "so a response is bounded by the page rather than the table."
         ),
     },
     {
         "name": "analyses",
         "description": (
-            "Per-request LLM- or model-backed analyses over a payload the caller supplies. "
-            "Distinct from **computer_vision** (which needs an image) and "
-            "**datascience_results** (which serves published rows)."
+            "Per-request LLM analyses over a payload the caller supplies.\n\n"
+            "Distinct from **computer_vision**, which needs an image, and from "
+            "**datascience_results**, which serves rows a pipeline already produced."
+        ),
+    },
+    {
+        "name": "service",
+        "description": (
+            "Unauthenticated service endpoints. `/health` is what the ECS target group "
+            "polls; its `timestamp` is an ISO-8601 instant carrying its UTC offset."
         ),
     },
 ]
@@ -106,24 +144,39 @@ app.include_router(computer_vision.router)
 app.include_router(datascience_results.router)
 app.include_router(analyses.router)
 
-logger.info(f'veritree datascience service live: {datetime.now()}')
+logger.info(f"api ready: service={config.repo.name} version={config.repo.version}")
 
 
-@app.get("/")
+@app.get("/", tags=["service"], summary="Service banner")
 async def landing():
     """
     Unauthenticated service banner.
 
     :return: a greeting naming the service and current time
     """
-    logger.info('client reached: app.get route /')
     return {"response": f"Welcome to the veritree datascience service: {datetime.now()}"}
 
 
-@app.get("/health")
+@app.get("/health", tags=["service"], summary="Liveness probe",
+         response_description="Service identity, version and the current UTC timestamp")
 async def health():
-    """Unauthenticated liveness probe for the ECS target group."""
-    return {"status": "ok", "service": config.repo.name, "version": config.repo.version}
+    """
+    Unauthenticated liveness probe for the ECS target group.
+
+    ``timestamp`` is an ISO-8601 instant carrying its UTC offset, so a reader can
+    convert it to their own zone without knowing where the task ran. Seconds
+    precision: a probe does not need milliseconds, and the shorter string stays
+    readable in logs.
+
+    :return: service identity, version, and the current timestamp
+    """
+
+    return {
+        "status": "ok",
+        "service": config.repo.name,
+        "version": config.repo.version,
+        "timestamp": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+    }
 
 
 @app.get("/favicon.ico", include_in_schema=False)

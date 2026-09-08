@@ -8,11 +8,18 @@ import pytest
 ROUTE = "/analyses/verification_summarization/"
 
 
+# A MISSING header is rejected by FastAPI's own APIKeyHeader, whose status code is a
+# framework detail: 403 up to fastapi 0.115.x, 401 from ~0.14x. Asserting either exact
+# code ties the suite to a pinned version, so these check the property that matters --
+# the request is refused. A WRONG token is our own code path and is pinned to 401.
+UNAUTHENTICATED = {401, 403}
+
+
 class TestAuthentication:
 
     def test_missing_token_is_rejected(self, analyses_client, rule_payload):
         client, _ = analyses_client
-        assert client.post(ROUTE, json=rule_payload).status_code == 401
+        assert client.post(ROUTE, json=rule_payload).status_code in UNAUTHENTICATED
 
     def test_wrong_token_is_rejected(self, analyses_client, rule_payload):
         client, _ = analyses_client

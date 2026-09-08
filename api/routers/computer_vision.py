@@ -20,7 +20,9 @@ veritree field photos, so the OpenCLIP, Gemini and OpenAI taggers were retired.
 
 import io
 import os
+import time
 import uuid
+from functools import lru_cache
 from typing import Annotated, List, Literal, Optional, Union
 
 from PIL import Image, UnidentifiedImageError
@@ -49,15 +51,86 @@ logger = context.logger
 router = APIRouter(prefix="/computer_vision", tags=["computer_vision"])
 
 
-# Only the source bucket is needed: every service reads an image and returns JSON, so
+# Only a source bucket is needed: every service reads an image and returns JSON, so
 # nothing is written back to S3.
-s3_source_handler = S3StorageHandler(
-    aws_accesskey=os.getenv("AWS_SOURCE_ACCESS_KEY_ID"),
-    aws_secretkey=os.getenv("AWS_SOURCE_SECRET_ACCESS_KEY"),
-    aws_regionname=os.getenv("AWS_SOURCE_REGION_NAME"),
-    aws_bucketname=os.getenv("AWS_SOURCE_S3_BUCKET_NAME"),
-    prod_mode=config.prod_mode,
-)
+#
+# Two env-var shapes are accepted. AWS_SOURCE_* is what veritree-survivability used and
+# what the ECS task definitions set; AWS_S3_* is the shape every other veritree
+# datascience repo uses, so a .env copied from one of those works unchanged. The
+# AWS_SOURCE_* names win when both are present.
+DEFAULT_BUCKET_ENV = {
+    "aws_accesskey": ("AWS_SOURCE_ACCESS_KEY_ID", "AWS_ACCESS_KEY_ID"),
+    "aws_secretkey": ("AWS_SOURCE_SECRET_ACCESS_KEY", "AWS_SECRET_ACCESS_KEY"),
+    "aws_regionname": ("AWS_SOURCE_REGION_NAME", "AWS_S3_REGION_NAME"),
+    "aws_bucketname": ("AWS_SOURCE_S3_BUCKET_NAME", "AWS_S3_BUCKET_NAME"),
+}
+
+
+def _bucket_settings() -> dict:
+    """
+    Resolve the default bucket's credentials from whichever env-var shape is set.
+
+    :return: kwargs for :class:`S3StorageHandler`
+    """
+
+    return {key: next((os.getenv(name) for name in names if os.getenv(name)), None)
+            for key, names in DEFAULT_BUCKET_ENV.items()}
+
+
+s3_source_handler = S3StorageHandler(prod_mode=config.prod_mode, **_bucket_settings())
+
+if not s3_source_handler.connected():
+    logger.warning(
+        "computer_vision no default bucket: set AWS_SOURCE_S3_BUCKET_NAME (or "
+        "AWS_S3_BUCKET_NAME) to read images by bare object key; requests using a full "
+        "s3://bucket/key URI name their own bucket and still work")
+
+
+@lru_cache(maxsize=8)
+def _bucket_handler(bucket_name: str) -> S3StorageHandler:
+    """
+    Handler for a bucket named explicitly in an ``s3://`` URI.
+
+    Cached: building a boto3 session per request would add a needless handshake, and
+    callers realistically use a small, fixed set of buckets.
+
+    :param bucket_name: bucket parsed out of the request's image_url
+    :return: a read-only handler for that bucket
+    """
+
+    settings = _bucket_settings()
+    settings["aws_bucketname"] = bucket_name
+
+    logger.info(f"computer_vision opening bucket from uri: bucket={bucket_name}")
+
+    return S3StorageHandler(prod_mode=config.prod_mode, **settings)
+
+
+def _resolve_source(image_url: str):
+    """
+    Work out which bucket and key an image_url refers to.
+
+    Three addressing forms are accepted, because all three are in use across the
+    veritree services:
+
+    * ``s3://bucket/key`` -- names its own bucket, so it works without a configured
+      default
+    * ``key/path.jpg`` -- a bare object key, read from the default source bucket
+    * ``https://...`` -- fetched over HTTP; handled by the caller, not here
+
+    :param image_url: the request's image_url
+    :return: (handler, key) for the object
+    """
+
+    if image_url.startswith('s3://'):
+        bucket_name, _, key = image_url[len('s3://'):].partition('/')
+
+        if not bucket_name or not key:
+            raise ValueError(f"Malformed S3 URI '{image_url}'; expected s3://bucket/key")
+
+        return _bucket_handler(bucket_name), key
+
+    return s3_source_handler, image_url
 
 # Pay the model-loading cost at import rather than on the first request.
 load_survivability_models()
@@ -73,7 +146,13 @@ class ComputerVisionInput(BaseModel):
     service: Literal['survivability_detection', 'content_tagging', 'content_moderation'] = Field(
         ..., description="Which computer vision service to route the image to")
     image_url: str = Field(
-        ..., description="S3 object key, or an https:// URL to the same object")
+        ...,
+        description=(
+            "The source image, addressed any of three ways: a full `s3://bucket/key` "
+            "URI (names its own bucket), a bare object key resolved against the "
+            "configured source bucket, or an `https://` URL fetched over HTTP."
+        ),
+        examples=["s3://veritree-impactteam-survivability/survivability/100/img.jpeg"])
 
 
 REQUEST_EXAMPLES = {
@@ -230,16 +309,17 @@ class ComputerVisionOutput(BaseModel):
 # Image loading
 # ---------------------------------------------------------------------------
 
-def _load_image(image_url: str) -> Image.Image:
+def _load_image(image_url: str, session_id: str) -> Image.Image:
     """
     Load the source image once, whichever way the caller addressed it.
 
-    Accepts both forms in use across the veritree services: a bare S3 object key,
-    read through the bucket handler, or an https:// URL to the same object, fetched
-    over HTTP. Reading here rather than inside each service means one fetch per
+    Accepts every form in use across the veritree services: a full ``s3://bucket/key``
+    URI, a bare object key read from the default source bucket, or an ``https://`` URL
+    fetched over HTTP. Reading here rather than inside each service means one fetch per
     request no matter which service runs, and no image ever touches local disk.
 
-    :param image_url: S3 object key, or an https:// URL
+    :param image_url: an s3:// URI, a bare S3 object key, or an https:// URL
+    :param session_id: correlation id, so a load failure ties to its request
     :return: the decoded PIL image
     :raises HTTPException: 502 if the source cannot be read, 400 if it is not an image
     """
@@ -248,16 +328,27 @@ def _load_image(image_url: str) -> Image.Image:
         if image_url.startswith(('http://', 'https://')):
             return load_photo(image_url)
 
-        return Image.open(io.BytesIO(s3_source_handler.read_bytes(image_url)))
+        handler, key = _resolve_source(image_url)
+
+        return Image.open(io.BytesIO(handler.read_bytes(key)))
+
+    except ValueError as e:
+        # A malformed s3:// URI is the caller's mistake, not an upstream failure.
+        err_string = f"Invalid image_url: {e}"
+        logger.error(f"computer_vision image load rejected: session_id={session_id} "
+                     f"image={image_url} error={e}")
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=err_string)
 
     except UnidentifiedImageError as e:
         err_string = f"Source at {image_url} is not a readable image: {e}"
-        logger.error(err_string)
+        logger.error(f"computer_vision image not decodable: session_id={session_id} "
+                     f"image={image_url} error={e}")
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=err_string)
 
     except Exception as e:
         err_string = f"Unable to read image {image_url}: {e}"
-        logger.error(err_string)
+        logger.error(f"computer_vision image unreadable: session_id={session_id} "
+                     f"image={image_url} error={e}")
         raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=err_string)
 
 
@@ -303,16 +394,16 @@ def _run_content_tagging(image, session_id: str) -> TaggingResult:
         session_id=session_id)
 
     if 'people' in matches:
-        logger.info('person detected in the image, routing to AI Content Moderation node')
+        logger.info(f"content_tagging chaining to moderation: session_id={session_id} reason=people_detected")
 
         moderation = _run_content_moderation(image, session_id)
 
         matches = list(matches) + list(moderation.tags)
         scores = dict(scores) | dict(moderation.scores or {})
 
-        logger.warning(f"AICM matches found: {moderation.tags} with scores: {moderation.scores}")
+        logger.warning(f"content_moderation flagged via chain: session_id={session_id} tags={moderation.tags} scores={moderation.scores}")
     else:
-        logger.info('no people detected, skipping AI Content Moderation node')
+        logger.info(f"content_tagging finished: session_id={session_id} moderation=skipped")
 
     return TaggingResult(tags=list(matches), scores=dict(scores))
 
@@ -343,7 +434,7 @@ def _run_content_moderation(image, session_id: str) -> ModerationResult:
     flagged = bool(matches)
 
     if flagged:
-        logger.warning(f"AICM flagged image with tags {matches} and scores {scores}")
+        logger.warning(f"content_moderation flagged: session_id={session_id} tags={matches} scores={scores}")
 
     return ModerationResult(flagged=flagged, tags=list(matches), scores=dict(scores))
 
@@ -372,7 +463,11 @@ SERVICES = {
         502: {"description": "The source image could not be read from S3 or over HTTP"},
     },
 )
-async def computer_vision(
+# Deliberately `def`, not `async def`: the body performs blocking I/O (database,
+# S3, model inference or an HTTP call to a provider). FastAPI runs a sync handler in
+# a threadpool, so the event loop stays free; the same body in an `async def` would
+# stall every other request, including /health, for its whole duration.
+def computer_vision(
     params: Annotated[ComputerVisionInput, Body(openapi_examples=REQUEST_EXAMPLES)],
 ):
     """
@@ -407,18 +502,19 @@ async def computer_vision(
     """
 
     session_id = str(uuid.uuid4())
+    started = time.monotonic()
 
-    logger.info(f"computer_vision {params.service}: ENTRY "
+    logger.info(f"computer_vision {params.service} started: "
                 f"session_id={session_id} image={params.image_url}")
 
-    image = _load_image(params.image_url)
+    image = _load_image(params.image_url, session_id)
 
     try:
         with image:
             width, height = image.size
             result = SERVICES[params.service](image, session_id)
 
-        logger.info(f"computer_vision {params.service}: EXIT session_id={session_id}")
+        logger.info(f"computer_vision {params.service} finished: session_id={session_id} duration={time.monotonic() - started:.2f}s")
 
         return ComputerVisionOutput(
             service=params.service,
@@ -429,5 +525,6 @@ async def computer_vision(
 
     except Exception as e:
         err_string = f"Exception while processing computer_vision {params.service}: {e}"
-        logger.error(err_string)
+        logger.error(f"computer_vision {params.service} failed: session_id={session_id} "
+                     f"duration={time.monotonic() - started:.2f}s error={e}")
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=err_string)

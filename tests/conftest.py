@@ -76,6 +76,14 @@ def _install_model_stubs():
 
 _install_model_stubs()
 
+# src/utils/context.py calls load_dotenv() at import, so the developer's real .env
+# leaks into the suite. Neutralise anything that could reach live infrastructure --
+# without this, constructing a handler opens an actual SSH tunnel to the bastion.
+for _name in list(os.environ):
+    if _name.startswith(("AWS_RDS_", "AWS_SOURCE_", "AWS_S3_")) or _name in {
+            "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY"}:
+        del os.environ[_name]
+
 os.environ.setdefault("API_ENDPOINT_TOKEN", "test-token")
 os.environ.setdefault("AWS_RDS_ENDPOINT", "localhost")
 os.environ.setdefault("AWS_RDS_PORT", "5432")
@@ -112,11 +120,21 @@ def client(tmp_path_factory):
     pd.DataFrame(RASTER_ROWS).to_sql(
         "tbl_raster_results", engine, index=False)
 
-    from src.awskit import datahandlers
-    datahandlers.pg_handler.engine = engine
-
     from src.awskit import datastores
-    datastores.pg_handler = datahandlers.pg_handler
+
+    # Every domain resolves to the same sqlite fixture. get_handler is the seam: the
+    # real one builds a per-domain engine from the environment (and may open an SSH
+    # tunnel), which a test must never do.
+    class FixtureHandler:
+        def __init__(self, engine):
+            self.engine = engine
+            self.tunnel = None
+
+        def ensure_ready(self):
+            pass
+
+    original_get_handler = datastores.get_handler
+    datastores.get_handler = lambda domain: FixtureHandler(engine)
 
     # sqlite has no schema qualifiers. The accessors read their table names from module
     # constants, so pointing those at the unqualified fixture tables is enough -- no
@@ -133,6 +151,7 @@ def client(tmp_path_factory):
     yield TestClient(app)
 
     datastores.BIOACOUSTICS_TABLE, datastores.MULTISPECTRAL_TABLE = original_tables
+    datastores.get_handler = original_get_handler
 
 
 @pytest.fixture

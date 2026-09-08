@@ -29,8 +29,10 @@ raw response, then route-specific inspection and the error cases worth confirmin
 - **`01`** covers `survivability_detection`, `content_tagging` and `content_moderation`
   in one notebook, since they are one endpoint. `image_url` takes either a bare S3
   object key or an `https://` URL to the same object.
-- **`04`** returns **501** by design until `veritree-tree-tracker-algorithms` publishes
-  a results table.
+- **`02`** reads the analytics database. **`03`** and **`04`** answer from a **live S3
+  scan** and pass `live_scan=true`; without it they return **501**, because their
+  database sources are not implemented. A scan is bounded by a 5-minute budget and
+  returns **504** if it exceeds it.
 - Outputs are not committed; clear them before committing (`jupyter nbconvert
   --clear-output --inplace notebooks/*.ipynb`) so credentials and site data stay out of
   version control.

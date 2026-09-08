@@ -20,6 +20,8 @@ boto3==1.35.46
 botocore==1.35.46          # transitive via boto3; pinned to keep the pair in step
 SQLAlchemy==2.0.30
 psycopg2-binary==2.9.11    # DBAPI driver SQLAlchemy loads by name, never imported
+sshtunnel==0.4.0           # only used when AWS_RDS_SSH_HOST is set
+paramiko>=3.4,<4
 pandas==2.2.1
 numpy<2
 

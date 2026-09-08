@@ -1,43 +1,47 @@
 # Environment Variables Template
-# Fill in blanks "<<<>>>" with your credentials
-# Then rename this file to ".env"
+# Fill in blanks "<<<>>>" with your credentials, then rename this file to ".env"
 
-# --- API ---
-API_ENDPOINT_TOKEN = "<<<>>>"
-
-# --- Model providers ---
-# ANTHROPIC_API_KEY backs content_tagging and content_moderation (the only backend),
-# and is the default for the verification_summarization analysis.
-ANTHROPIC_API_KEY = "<<<>>>"
-# Only needed if configs/config_cv_verification_summarization.yaml is switched to a
-# gpt or gemini model; no computer_vision route uses these.
-OPENAI_API_KEY = "<<<>>>"
-GOOGLE_AI_STUDIO_API_KEY = "<<<>>>"
-
-# --- Analytics database (datascience_results routes) ---
-AWS_RDS_REGION_NAME = "<<<>>>"
-AWS_RDS_ENDPOINT = "<<<>>>"
-AWS_RDS_PORT = <<<>>>
-AWS_RDS_DB = "<<<>>>"
-AWS_RDS_USER_NAME = "<<<>>>"
-AWS_RDS_PASSWORD = "<<<>>>"
-
-# --- Default AWS credentials ---
-# Loaded into the process environment by dotenv.load_dotenv() in src/utils/context.py.
-# No os.getenv() call reads these by name: boto3's default credential chain picks them
-# up from the environment itself, which is what a bare boto3.Session() resolves against
-# when prod_mode is True. Do not remove because a code search finds no reference.
+# AWS account credentials; also the default S3 source bucket for computer_vision
 AWS_ACCESS_KEY_ID = "<<<>>>"
 AWS_SECRET_ACCESS_KEY = "<<<>>>"
 AWS_S3_REGION_NAME = "<<<>>>"
 AWS_S3_BUCKET_NAME = "<<<>>>"
 
-# --- Computer vision source bucket (inbound field photos) ---
-AWS_SOURCE_ACCESS_KEY_ID = "<<<>>>"
-AWS_SOURCE_SECRET_ACCESS_KEY = "<<<>>>"
-AWS_SOURCE_REGION_NAME = "<<<>>>"
-AWS_SOURCE_S3_BUCKET_NAME = "<<<>>>"
+# SSH bastion fronting the databases. The only shared defaults: any domain below that
+# does not set its own AWS_RDS_<DOMAIN>_SSH_* uses these. Omit to connect directly.
+AWS_RDS_SSH_HOST = "<<<>>>"
+AWS_RDS_SSH_PORT = "22"
+AWS_RDS_SSH_USER = "<<<>>>"
+AWS_RDS_SSH_PKEY = "~/.ssh/id_rsa"
+AWS_RDS_SSH_PKEY_PASSWORD = "<<<>>>"
 
-# NOTE: AWS_DESTINATION_* is no longer required. survivability_classifier returns
-# bounding boxes as JSON instead of writing an annotated image back to S3, so the
-# service has no destination bucket. Remove these from your ECS task definitions.
+# Per-domain databases, read by the datascience_results routes. Each domain lives on
+# its own server, so ENDPOINT / PORT / DB / USER_NAME / PASSWORD have NO shared
+# fallback -- a domain is unconfigured unless its own variables are set, and its route
+# returns 501 naming the ones missing.
+AWS_RDS_BIOACOUSTICS_ENDPOINT = "<<<>>>"
+AWS_RDS_BIOACOUSTICS_PORT = "5432"
+AWS_RDS_BIOACOUSTICS_DB = "<<<>>>"
+AWS_RDS_BIOACOUSTICS_USER_NAME = "<<<>>>"
+AWS_RDS_BIOACOUSTICS_PASSWORD = "<<<>>>"
+
+# multispectral and treetracker answer from a live S3 scan today (live_scan=true), so
+# these are only needed if their database sources are implemented later.
+# AWS_RDS_MULTISPECTRAL_ENDPOINT = ""
+# AWS_RDS_MULTISPECTRAL_PORT = ""
+# AWS_RDS_MULTISPECTRAL_DB = ""
+# AWS_RDS_MULTISPECTRAL_USER_NAME = ""
+# AWS_RDS_MULTISPECTRAL_PASSWORD = ""
+# AWS_RDS_TREETRACKER_ENDPOINT = ""
+# AWS_RDS_TREETRACKER_PORT = ""
+# AWS_RDS_TREETRACKER_DB = ""
+# AWS_RDS_TREETRACKER_USER_NAME = ""
+# AWS_RDS_TREETRACKER_PASSWORD = ""
+
+# Token required on the Token header of every route except / and /health
+API_ENDPOINT_TOKEN = "<<<>>>"
+
+# Model provider API keys; ANTHROPIC_API_KEY backs content_tagging and content_moderation
+ANTHROPIC_API_KEY = "<<<>>>"
+OPENAI_API_KEY = "<<<>>>"
+GOOGLE_AI_STUDIO_API_KEY = "<<<>>>"

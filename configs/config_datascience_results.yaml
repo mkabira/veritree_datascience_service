@@ -3,6 +3,10 @@
 # Read-only result sources served by the /datascience_results routes.
 # Each entry names the upstream repository that writes the table, so the
 # provenance of every endpoint is traceable from configuration alone.
+#
+# These live in SEPARATE databases on separate servers, so each domain resolves its
+# own connection from AWS_RDS_<DOMAIN>_* (falling back to the shared AWS_RDS_*).
+# See src/awskit/datahandlers.py :: DOMAIN_ENV_PREFIXES.
 
 datascience_results:
   default_limit: 1000
@@ -13,15 +17,41 @@ datascience_results:
     schema:        'bioacoustics'
     table:         'tbl_postprocess_site_level_indicies'
     filters:       ['code_country', 'code_site', 'recording_year']
+    # Lives on the read replica, not the impact-team instance. Configure with
+    # AWS_RDS_BIOACOUSTICS_* if it differs from the shared AWS_RDS_* settings.
 
   multispectral:
     upstream_repo: 'veritree_multispectral_foresthealth'
     schema:        'multispectral'
     table:         'tbl_raster_results'
     filters:       ['country', 'site', 'subsite', 'period', 'raster']
+    # The database source is not implemented; the route answers from S3 instead.
+    live_scan:
+      # Verified against the live bucket. The foresthealth repo's config names
+      # veritree-business-intelligence, but that holds the BI landing zone; the
+      # rasters are written here.
+      bucket:         'veritree-impactteam-multispectral'
+      region:         'us-east-2'
+      base_prefix:    'multispectral_foresthealth/data_foresthealth/'
+      rasters_marker: '/outputs/rasters/'   # only keys under this are output rasters
+      extensions:     ['.tif']
+      timeout_seconds: 300   # abort rather than hold a threadpool slot indefinitely
 
   treetracker:
     upstream_repo: 'veritree-tree-tracker-algorithms'
     schema:        'treetracker'
-    table:         null      # TODO: upstream does not yet publish a results table
+    table:         null
+    # NOT PUBLISHED AT ALL. veritree-tree-tracker-algorithms writes only staging/fact
+    # tables and dim_* rollups. The route answers from S3 instead.
+    live_scan:
+      # Verified against the live bucket. The tree-tracker repo's config says
+      # ca-central-1, but the bucket is in us-east-2.
+      bucket:          'veritree-tree-trackers'
+      region:          'us-east-2'
+      prefix:          'data/data_optimized'   # data_transformed also works
+      read_properties: False   # range-read each track header for its GPS point counts;
+                               # accurate, but one extra request per asset
+      probe_bytes:     8192
+      max_workers:     8
+      timeout_seconds: 300   # abort rather than hold a threadpool slot indefinitely
     filters:       ['country', 'site', 'session_id']

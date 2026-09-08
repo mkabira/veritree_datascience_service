@@ -57,14 +57,14 @@ def load_models():
         return _detection_model, _classification_model
 
     detection_path = context.root_dir + config.pipeline.object_model_path
-    logger.info(f"Loading mangrove detection model (YOLO) from: {detection_path}")
+    logger.info(f"survivability_detection loading detector: path={detection_path}")
     _detection_model = YOLO(detection_path)
 
     classification_path = context.root_dir + config.pipeline.survival_model_path
-    logger.info(f"Loading mangrove classification model (Keras) from: {classification_path}")
+    logger.info(f"survivability_detection loading classifier: path={classification_path}")
     _classification_model = keras.models.load_model(classification_path)
 
-    logger.info("Survivability models loaded")
+    logger.info("survivability_detection models loaded")
 
     return _detection_model, _classification_model
 
@@ -114,7 +114,7 @@ def detect_survivability(image, session_id=None):
     session_id = session_id or str(uuid.uuid4())
     start_time_clock = time.time()
 
-    logger.info(f"STARTING SURVIVABILITY DETECTION: SessionID:{session_id}")
+    logger.info(f"survivability_detection started: session_id={session_id}")
 
     # Honour EXIF orientation in memory. utils.rotate_image cannot be used here: its
     # except branch reads image.filename, which does not exist on an image opened
@@ -134,7 +134,7 @@ def detect_survivability(image, session_id=None):
     counts = {label: 0 for label in CLASS_LABELS}
 
     if len(results) > 0:
-        logger.info(f"Detection model found {len(results)} mangroves (session {session_id})")
+        logger.info(f"survivability_detection detected: session_id={session_id} mangroves={len(results)}")
 
         boxes_xywhn = results.boxes.xywhn.tolist()
         boxes_xyxy = results.boxes.xyxy.tolist()
@@ -163,7 +163,7 @@ def detect_survivability(image, session_id=None):
                 },
             })
     else:
-        logger.warning(f"No mangroves found (session {session_id}) at confidence "
+        logger.warning(f"survivability_detection found nothing: session_id={session_id} "
                        f"threshold {config.pipeline.confidence}")
 
     payload = {
@@ -178,7 +178,10 @@ def detect_survivability(image, session_id=None):
     }
 
     duration = time.time() - start_time_clock
-    logger.info(f"Detection completed (session {session_id}) in {np.round(duration, 2)}s: "
-                f"{payload['counts']}")
+    counts = payload['counts']
+    logger.info(f"survivability_detection finished: session_id={session_id} "
+                f"mangroves={counts['number_mangroves']} alive={counts['number_alive']} "
+                f"dead={counts['number_dead']} unclear={counts['number_unclear']} "
+                f"duration={duration:.2f}s")
 
     return payload

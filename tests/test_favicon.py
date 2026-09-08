@@ -70,3 +70,47 @@ class TestDocsUseOurFavicon:
     def test_openapi_schema_still_served(self, app_client):
         """Overriding the docs routes must not disturb the schema they read."""
         assert app_client.get("/openapi.json").status_code == 200
+
+
+class TestHealth:
+    """The ECS target group reads this; its shape is a contract."""
+
+    def test_reports_service_identity_and_version(self, app_client):
+        body = app_client.get("/health").json()
+
+        assert body["status"] == "ok"
+        assert body["service"] == context.config.repo.name
+        assert body["version"] == context.config.repo.version
+
+    def test_includes_a_parseable_timestamp(self, app_client):
+        import datetime
+
+        body = app_client.get("/health").json()
+        parsed = datetime.datetime.fromisoformat(body["timestamp"])
+
+        now = datetime.datetime.now(datetime.timezone.utc)
+        assert abs((now - parsed).total_seconds()) < 120
+
+    def test_the_timestamp_carries_its_offset(self, app_client):
+        """
+        A naive timestamp is ambiguous: a probe is read from wherever the task runs,
+        so the reader cannot infer the zone.
+        """
+        import datetime
+
+        body = app_client.get("/health").json()
+        parsed = datetime.datetime.fromisoformat(body["timestamp"])
+
+        assert parsed.tzinfo is not None, "timestamp must be timezone-aware"
+        assert parsed.utcoffset() == datetime.timedelta(0), "should be UTC"
+
+    def test_the_timestamp_includes_date_and_time(self, app_client):
+        body = app_client.get("/health").json()
+
+        date_part, _, time_part = body["timestamp"].partition("T")
+        assert len(date_part.split("-")) == 3
+        assert time_part, "timestamp must carry a time, not just a date"
+
+    def test_needs_no_auth(self, app_client):
+        """The probe sends no headers; requiring a token would fail every check."""
+        assert app_client.get("/health").status_code == 200

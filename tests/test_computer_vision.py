@@ -14,13 +14,20 @@ ROUTE = "/computer_vision/"
 SERVICES = ["survivability_detection", "content_tagging", "content_moderation"]
 
 
+# A MISSING header is rejected by FastAPI's own APIKeyHeader, whose status code is a
+# framework detail: 403 up to fastapi 0.115.x, 401 from ~0.14x. Asserting either exact
+# code ties the suite to a pinned version, so these check the property that matters --
+# the request is refused. A WRONG token is our own code path and is pinned to 401.
+UNAUTHENTICATED = {401, 403}
+
+
 class TestAuthentication:
 
     def test_missing_token_is_rejected(self, cv_client):
         client, _ = cv_client
         response = client.post(ROUTE, json={"service": "content_tagging",
                                             "image_url": "a.jpg"})
-        assert response.status_code == 401
+        assert response.status_code in UNAUTHENTICATED
 
 
 class TestServiceDispatch:
@@ -307,3 +314,83 @@ class TestOpenApiDocumentation:
         """The result is a union, so a worked example per shape is what makes it legible."""
         schema = self._schema(cv_client)
         assert "example" in schema["components"]["schemas"][model]
+
+
+class TestImageAddressingForms:
+    """
+    Three addressing forms are in use across the veritree services and all must work:
+    a full s3:// URI, a bare object key, and an https:// URL.
+    """
+
+    def test_an_s3_uri_reads_from_the_bucket_it_names(self, cv_client, auth, monkeypatch):
+        """s3://bucket/key carries its own bucket, so it works with no default set."""
+        from api.routers import computer_vision
+
+        seen = {}
+
+        class NamedBucket:
+            def read_bytes(self, key):
+                seen["key"] = key
+                return cv_client[1].payload
+
+        monkeypatch.setattr(computer_vision, "_bucket_handler",
+                            lambda bucket: seen.setdefault("bucket", bucket) and None or NamedBucket())
+
+        client, default_handler = cv_client
+        response = client.post(ROUTE, json={
+            "service": "content_tagging",
+            "image_url": "s3://other-bucket/survivability/100/img.jpeg"}, headers=auth)
+
+        assert response.status_code == 200
+        assert seen["bucket"] == "other-bucket"
+        assert seen["key"] == "survivability/100/img.jpeg"
+        assert default_handler.requested == [], "must not fall back to the default bucket"
+
+    def test_a_bare_key_uses_the_default_bucket(self, cv_client, auth):
+        client, fake = cv_client
+        client.post(ROUTE, json={"service": "content_tagging",
+                                 "image_url": "survivability/100/img.jpeg"}, headers=auth)
+        assert fake.requested == ["survivability/100/img.jpeg"]
+
+    @pytest.mark.parametrize("bad", ["s3://only-a-bucket", "s3://", "s3:///key-with-no-bucket"])
+    def test_a_malformed_s3_uri_is_400_not_502(self, cv_client, auth, bad):
+        """The caller's mistake, not an upstream storage failure."""
+        client, _ = cv_client
+        response = client.post(ROUTE, json={"service": "content_tagging",
+                                            "image_url": bad}, headers=auth)
+
+        assert response.status_code == 400
+        assert "Invalid image_url" in response.json()["detail"]
+
+
+class TestBucketEnvFallback:
+    """
+    Two env-var shapes exist across the veritree repos. A .env from any of them should
+    work: AWS_SOURCE_* (survivability, and the ECS task definitions) or AWS_S3_*
+    (every other datascience repo).
+    """
+
+    def test_aws_source_names_win_when_both_are_set(self, monkeypatch):
+        from api.routers import computer_vision
+
+        monkeypatch.setenv("AWS_SOURCE_S3_BUCKET_NAME", "source-bucket")
+        monkeypatch.setenv("AWS_S3_BUCKET_NAME", "fallback-bucket")
+
+        assert computer_vision._bucket_settings()["aws_bucketname"] == "source-bucket"
+
+    def test_aws_s3_names_are_used_when_source_is_absent(self, monkeypatch):
+        from api.routers import computer_vision
+
+        monkeypatch.delenv("AWS_SOURCE_S3_BUCKET_NAME", raising=False)
+        monkeypatch.setenv("AWS_S3_BUCKET_NAME", "fallback-bucket")
+
+        assert computer_vision._bucket_settings()["aws_bucketname"] == "fallback-bucket"
+
+    def test_neither_set_yields_none_rather_than_raising(self, monkeypatch):
+        """Boot must not abort: s3:// requests name their own bucket and still work."""
+        from api.routers import computer_vision
+
+        for name in ["AWS_SOURCE_S3_BUCKET_NAME", "AWS_S3_BUCKET_NAME"]:
+            monkeypatch.delenv(name, raising=False)
+
+        assert computer_vision._bucket_settings()["aws_bucketname"] is None

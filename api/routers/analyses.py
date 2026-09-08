@@ -112,7 +112,11 @@ def _strip_code_fences(text: str) -> str:
         500: {"description": "The model returned something other than a JSON array"},
     },
 )
-async def verification_summarization(params: FlagSuggestionInput):
+# Deliberately `def`, not `async def`: the body performs blocking I/O (database,
+# S3, model inference or an HTTP call to a provider). FastAPI runs a sync handler in
+# a threadpool, so the event loop stays free; the same body in an `async def` would
+# stall every other request, including /health, for its whole duration.
+def verification_summarization(params: FlagSuggestionInput):
     """
     Convert raw verification rule failures into user-friendly flag messages for the
     field team.
@@ -121,12 +125,11 @@ async def verification_summarization(params: FlagSuggestionInput):
     :return: session_id and plain-language flag summary
     """
 
-    logger.info("analyses verification_summarization: ENTRY")
+    session_id = str(uuid.uuid4())
 
     rule_ids = [rule.rule_public_id for rule in params.rules]
-    logger.info(f"verification_summarization received {len(params.rules)} rules: {rule_ids}")
-
-    session_id = str(uuid.uuid4())
+    logger.info(f"analyses verification_summarization started: session_id={session_id} "
+                f"rules={len(params.rules)} rule_ids={rule_ids}")
 
     try:
         rules_payload = [
@@ -145,7 +148,8 @@ async def verification_summarization(params: FlagSuggestionInput):
             failed_rules=json.dumps(rules_payload, indent=2)
         )
 
-        logger.info(f"verification_summarization: using model='{flag_config.model}'")
+        logger.info(f"analyses verification_summarization calling model: "
+                    f"session_id={session_id} model={flag_config.model}")
         llm_response = llm_chat(
             system_prompt=flag_config.system_prompt,
             user_prompt=user_prompt,
@@ -163,11 +167,13 @@ async def verification_summarization(params: FlagSuggestionInput):
             for item in llm_results
         ]
 
-        logger.info(f"analyses verification_summarization - session_id={session_id}: EXIT")
+        logger.info(f"analyses verification_summarization finished: session_id={session_id} "
+                    f"flags={len(suggested_flags)}")
 
         return FlagSuggestionOutput(session_id=session_id, suggested_flags=suggested_flags)
 
     except Exception as e:
         err_string = f"Exception while processing verification_summarization: {str(e)}"
-        logger.error(err_string)
+        logger.error(f"analyses verification_summarization failed: "
+                     f"session_id={session_id} error={e}")
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=err_string)

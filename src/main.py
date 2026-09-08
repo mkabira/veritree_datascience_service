@@ -24,7 +24,7 @@ logger = context.logger
 
 
 datenow = datetime.datetime.now()
-logger.info(f'VERITREE DATASCIENCE SERVICE STARTED: {datenow}')
+logger.info(f"service starting: version={config.repo.version} started_at={datenow}")
 
 
 def call_task_launch_api():

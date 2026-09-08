@@ -1,6 +1,26 @@
 """
 Project-wide configuration and logging.
 
+Logging convention
+------------------
+Every line reads ``<component> <event>`` followed by ``key=value`` pairs, so lines are
+greppable and machine-parseable without being a full structured-logging dependency::
+
+    computer_vision survivability_detection started: session_id=4cd8 image=s3://...
+    computer_vision survivability_detection finished: session_id=4cd8 duration=1.60s
+
+Rules:
+
+* **Request-scoped lines carry ``session_id=``.** Handlers run concurrently in a
+  threadpool, so without it two interleaved requests cannot be told apart in the log.
+* **Levels mean something.** ``info`` for lifecycle and outcomes, ``warning`` for a
+  degraded-but-handled condition the operator should see, ``error`` for a failed
+  request. Nothing routine logs above ``info``.
+* **No shouting and no exclamation marks.** Upper case is reserved for acronyms.
+* **Durations are ``duration=<seconds>s`` to two decimals.**
+* **Never log a credential.** Database URLs are rendered through SQLAlchemy, which
+  masks the password.
+
 Importing this module loads the .env file, merges every configs/*.yaml into a single
 flat namespace, and configures the shared logger. Both are exposed as module-level
 singletons that the rest of the service imports:

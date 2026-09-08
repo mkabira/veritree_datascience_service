@@ -88,7 +88,7 @@ def classify_image_anthropic(client, model_name, image, tag_names, system_prompt
         media_type = "image/jpeg"
 
     except Exception as e:
-        logger.error(f"Error: unable to encode verification photo: {e}")
+        logger.error(f"veritag encode failed: error={e}")
         return {}
 
     matches = {}
@@ -155,6 +155,6 @@ def classify_image_anthropic(client, model_name, image, tag_names, system_prompt
                         matches[i_tag_name] = probability
 
         except Exception as e:
-            logger.error(f"Error processing tag '{i_tag_name}': {e}")
+            logger.error(f"veritag tag failed: tag={i_tag_name} error={e}")
 
     return matches

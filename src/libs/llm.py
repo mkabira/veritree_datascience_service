@@ -64,7 +64,7 @@ def llm_chat(system_prompt: str, user_prompt: str, model: str = 'gpt-4o', temper
     if not api_key:
         raise ValueError(f"API key not set. Please set {key_name} in your environment.")
 
-    logger.info(f"llm_chat: alias='{model}' → model='{litellm_model}'")
+    logger.info(f"llm_chat routing: alias={model} model={litellm_model}")
 
     response = litellm.completion(
         model=litellm_model,

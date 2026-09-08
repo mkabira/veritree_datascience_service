@@ -7,6 +7,11 @@ One section per domain, mirroring the /datascience_results route groups:
   multispectral  -> multispectral.tbl_raster_results
   treetracker    -> pending, see :func:`get_treetracker_results`
 
+These live in separate databases on separate servers, so each accessor resolves its
+own engine by domain rather than sharing one. A domain with no configured endpoint,
+or whose table is absent, raises :class:`ResultsTableUnavailable` -- the route turns
+that into a 501, which reads as "not available here" rather than a server fault.
+
 Every accessor returns a :class:`ResultPage`: the requested slice of rows plus the
 total number matching the filters. Both LIMIT/OFFSET and the count are evaluated by
 the database, so response size is bounded by the page rather than by table size --
@@ -24,8 +29,9 @@ from typing import NamedTuple, Optional
 
 import pandas as pd
 from sqlalchemy import text
+from sqlalchemy.exc import ProgrammingError
 
-from src.awskit.datahandlers import pg_handler
+from src.awskit.datahandlers import DatabaseNotConfigured, get_handler
 
 from src.utils import context
 
@@ -38,6 +44,21 @@ logger = context.logger
 # data. These allowlists pin them to values defined in this module.
 BIOACOUSTICS_TABLE = 'bioacoustics.tbl_postprocess_site_level_indicies'
 MULTISPECTRAL_TABLE = 'multispectral.tbl_raster_results'
+
+# Domain keys, matching src.awskit.datahandlers.DOMAIN_ENV_PREFIXES
+BIOACOUSTICS_DOMAIN = 'bioacoustics'
+MULTISPECTRAL_DOMAIN = 'multispectral'
+TREETRACKER_DOMAIN = 'treetracker'
+
+
+class ResultsTableUnavailable(NotImplementedError):
+    """
+    The upstream pipeline has not published its results table to this database yet.
+
+    Distinct from a query failure: nothing is broken here, the data simply is not
+    there. The routes map it to 501 so a caller can tell "not published yet" apart
+    from "the service is misconfigured".
+    """
 
 
 class ResultPage(NamedTuple):
@@ -70,26 +91,40 @@ def _build_where(filters: dict) -> tuple:
     return clause, active
 
 
-def _fetch_page(table: str, filters: dict, limit: int, offset: int) -> ResultPage:
+def _fetch_page(domain: str, table: str, filters: dict,
+                limit: int, offset: int) -> ResultPage:
     """
-    Fetch one page from a table, plus the total matching the same filters.
+    Fetch one page from a domain's table, plus the total matching the same filters.
 
     Two round trips rather than one: counting in SQL is what keeps the row fetch
     bounded, and both statements hit the same filtered index.
 
+    :param domain: which database to query, e.g. 'bioacoustics'
     :param table: schema-qualified table name; must be a module constant, never
         request data, since it is interpolated rather than bound
     :param filters: mapping of column name to value; None values are ignored
     :param limit: maximum rows to return
     :param offset: rows to skip
     :return: the page and the pre-paging total
-    :raises Exception: re-raised after logging so the route maps it to a 5xx
+    :raises ResultsTableUnavailable: if the domain has no database configured, or the
+        table is absent from it
+    :raises Exception: any other failure, re-raised after logging
     """
 
     where, params = _build_where(filters)
 
     try:
-        with pg_handler.engine.connect() as connection:
+        handler = get_handler(domain)
+    except DatabaseNotConfigured as e:
+        logger.warning(f"datastores domain unconfigured: domain={domain} error={e}")
+        raise ResultsTableUnavailable(str(e)) from e
+
+    try:
+        # No-op unless tunnelling; restarts a dropped SSH forward before the pool
+        # hands out a connection through a local port that no longer exists.
+        handler.ensure_ready()
+
+        with handler.engine.connect() as connection:
             total = connection.execute(
                 text(f"select count(*) from {table}{where}"), params
             ).scalar_one()
@@ -100,16 +135,26 @@ def _fetch_page(table: str, filters: dict, limit: int, offset: int) -> ResultPag
                 params={**params, '_limit': limit, '_offset': offset},
             )
 
+    except ProgrammingError as e:
+        if 'UndefinedTable' in str(type(e.orig)) or 'does not exist' in str(e.orig):
+            logger.warning(f"datastores table absent: table={table} "
+                           f"reason=upstream_has_not_published")
+            raise ResultsTableUnavailable(
+                f"'{table}' has not been published to this database yet") from e
+
+        logger.error(f"datastores query rejected: table={table} error={e}")
+        raise
+
     except Exception as e:
-        logger.error(f"Query against {table} failed: {e}")
+        logger.error(f"datastores query failed: table={table} error={e}")
         raise
 
     # A surrogate index column from pandas' to_sql on the writing side; not data.
     if 'index' in rows.columns:
         rows = rows.drop(columns=['index'])
 
-    logger.info(f"{table}: returned {len(rows)} of {total} matching rows "
-                f"(limit={limit} offset={offset})")
+    logger.info(f"datastores query ok: table={table} returned={len(rows)} "
+                f"matched={total} limit={limit} offset={offset}")
 
     return ResultPage(rows=rows, total=total)
 
@@ -133,6 +178,7 @@ def get_postprocess_site_level_indicies(code_country: Optional[str] = None,
     """
 
     return _fetch_page(
+        BIOACOUSTICS_DOMAIN,
         BIOACOUSTICS_TABLE,
         {'code_country': code_country, 'code_site': code_site,
          'recording_year': recording_year},
@@ -147,12 +193,14 @@ def get_raster_results(country: Optional[str] = None,
                        limit: int = 1000,
                        offset: int = 0) -> ResultPage:
     """
-    Get indexed multispectral raster outputs joined to veritree planting site ids.
+    Get indexed multispectral raster outputs from the published table.
 
-    Written by veritree_multispectral_foresthealth ::
-    task_publish_geospatial_service. Columns: project_name, country, site, region_id,
-    subsite, site_id, period, capture_date, raster, raster_name, s3_key, s3_uri,
-    https_url, generated_at.
+    NOT IMPLEMENTED. The route answers from a live S3 scan instead, which indexes the
+    rasters straight out of the bucket and needs no publish step. To restore the
+    database source, delegate to :func:`_fetch_page` with ``MULTISPECTRAL_DOMAIN`` and
+    ``MULTISPECTRAL_TABLE`` as the bioacoustics accessor does, and drop the raise --
+    the table, its columns and its filters are recorded in
+    configs/config_datascience_results.yaml.
 
     :param country: optional country filter
     :param site: optional site filter
@@ -161,14 +209,13 @@ def get_raster_results(country: Optional[str] = None,
     :param raster: optional raster product filter, e.g. PRODUCTIVITY or STRUCTURE
     :param limit: maximum rows to return
     :param offset: rows to skip
-    :return: page of raster results and the pre-paging total
+    :return: page of raster results
+    :raises ResultsTableUnavailable: always, until the database source is implemented
     """
 
-    return _fetch_page(
-        MULTISPECTRAL_TABLE,
-        {'country': country, 'site': site, 'subsite': subsite,
-         'period': period, 'raster': raster},
-        limit, offset)
+    raise ResultsTableUnavailable(
+        "The database source for multispectral_results is not implemented; "
+        "pass live_scan=true to index the rasters directly from S3")
 
 
 def get_treetracker_results(country: Optional[str] = None,
@@ -177,15 +224,13 @@ def get_treetracker_results(country: Optional[str] = None,
                             limit: int = 1000,
                             offset: int = 0) -> ResultPage:
     """
-    Get processed GPS tree-tracker session results.
+    Get processed GPS tree-tracker session results from a published table.
 
-    NOT YET IMPLEMENTED. veritree-tree-tracker-algorithms currently writes only the
-    staging/fact tables it consumes (planting_sites, field_updates, allocations,
-    tree_orders, capacities, planting_partners) plus dim_* rollups; there is no
-    published per-session results table equivalent to the two above. Once that repo
-    publishes one, set the table in configs/config_datascience_results.yaml, add a
-    module constant for it, delegate to :func:`_fetch_page` as the others do, and
-    drop the raise.
+    NOT IMPLEMENTED, and nothing upstream publishes one: veritree-tree-tracker-algorithms
+    writes only the staging/fact tables it consumes plus dim_* rollups. The route
+    answers from a live S3 scan of the session assets instead. To add a database
+    source, name the table in configs/config_datascience_results.yaml, add a module
+    constant for it, delegate to :func:`_fetch_page`, and drop the raise.
 
     :param country: optional country filter
     :param site: optional site filter
@@ -193,9 +238,9 @@ def get_treetracker_results(country: Optional[str] = None,
     :param limit: maximum rows to return
     :param offset: rows to skip
     :return: page of tree-tracker session results
-    :raises NotImplementedError: until the upstream results table exists
+    :raises ResultsTableUnavailable: always, until a results table exists upstream
     """
 
-    raise NotImplementedError(
-        "treetracker results table is not yet published by veritree-tree-tracker-algorithms"
-    )
+    raise ResultsTableUnavailable(
+        "The database source for treetracker_results is not implemented; "
+        "pass live_scan=true to index the session assets directly from S3")

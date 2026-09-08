@@ -15,7 +15,6 @@ and threshold from configs/config_cv_content_moderation.yaml.
 
 import time
 
-import numpy as np
 
 from src.libs import veritag
 from src.utils import context
@@ -46,11 +45,11 @@ def run_veritag_anthropic(model_name, image, tag_names,
         threshold; scores maps every tag to its probability
     """
 
-    logger.info(f"STARTING CONTENT TAGGING W ANTHROPIC: SessionID:{session_id}")
+    logger.info(f"content_tagging started: session_id={session_id} model={model_name}")
 
     start_time_clock = time.time()
 
-    logger.info(f"Performing CV object detection on input image ({image.width}x{image.height})")
+    logger.info(f"content_tagging classifying: session_id={session_id} image={image.width}x{image.height} tags={len(tag_names)}")
     matches = veritag.classify_image_anthropic(client=client_anthropic,
                                                model_name=model_name,
                                                image=image,
@@ -59,6 +58,6 @@ def run_veritag_anthropic(model_name, image, tag_names,
                                                threshold=threshold)
 
     duration = time.time() - start_time_clock
-    logger.info(f"TASK COMPLETED!: {duration//60}mins or : {np.round(duration,2)}secs")
+    logger.info(f"content_tagging finished: session_id={session_id} matches={len(matches)} duration={duration:.2f}s")
 
     return list(matches.keys()), matches
